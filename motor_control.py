@@ -1,0 +1,332 @@
+"""电动轮椅 CAN 协议控制。默认仅预览；--send 才连接硬件。"""
+from __future__ import annotations
+
+import argparse
+import math
+import struct
+import sys
+import time
+
+GEAR_RATIO = 15.75
+
+
+def bounded(value, low, high, name):
+    if not math.isfinite(value) or not low <= value <= high:
+        raise ValueError(f'{name} 必须在 {low}..{high} 之间')
+    return value
+
+
+def speed_raw(rpm: float, max_rpm: float) -> int:
+    bounded(max_rpm, 0.1, 6553.5, '最高转速')
+    bounded(rpm, -max_rpm, max_rpm, '目标转速')
+    return round(rpm / max_rpm * 16384)
+
+
+def wheel_speed_raw(wheel_rpm: float, max_motor_rpm: float, direction=1) -> int:
+    motor_rpm = wheel_rpm * GEAR_RATIO * direction
+    return speed_raw(motor_rpm, max_motor_rpm)
+
+
+def control_frame(right: int, left: int, torque=20, depth=100, enabled=True):
+    for speed in (right, left):
+        bounded(speed, -16384, 16384, '速度原始值')
+    bounded(torque, 0, 100, '转矩百分比')
+    bounded(depth, 0, 100, '摇杆深度')
+    # 第4位按从1起计数理解为 bit3；未充电=1。
+    return struct.pack('>hhBBBB', right, left, torque, depth, 0,
+                       0x08 | (0x05 if enabled else 0))
+
+
+def external_frame(right: int, left: int, enabled=True):
+    for speed in (right, left):
+        bounded(speed, -16384, 16384, '速度原始值')
+    # 只开启速度控制，不开启模拟摇杆；X/Y未启用，填0。
+    return struct.pack('>hhBBBB', right, left, 5 if enabled else 0, 0, 0, 0)
+
+
+def config_frame(max_rpm, battery='lithium', swap=False, pi=0,
+                 left_comp=0, right_comp=0, overvoltage=33,
+                 undervoltage=22, brake_voltage=13):
+    bounded(max_rpm, 0.1, 6553.5, '最高转速')
+    if battery not in ('lithium', 'lead'):
+        raise ValueError('未知电池类型')
+    for value, lo, hi, name in (
+        (pi, 0, 2, 'PI组'), (left_comp, 0, 10, '左补偿'),
+        (right_comp, 0, 10, '右补偿'), (overvoltage, 29, 35, '过压'),
+        (undervoltage, 18, 23, '欠压'), (brake_voltage, 6, 15, '刹车电压')):
+        bounded(value, lo, hi, name)
+    flags = (battery == 'lead') | ((5 if swap else 0) << 1) | (pi << 4)
+    return struct.pack('<HBBBBBB', round(max_rpm * 10), flags,
+                       left_comp | (right_comp << 4), overvoltage,
+                       undervoltage, brake_voltage, 0xAA)
+
+
+def parse_feedback(can_id, data):
+    if can_id not in (0x101, 0x102) or len(data) != 8:
+        return None
+    speed, current = struct.unpack('>hH', data[:4])
+    return dict(wheel='左' if can_id == 0x101 else '右', speed_raw=speed,
+                current_raw=current, fault=data[4], battery_raw=data[5],
+                extra=data[6], revolutions=data[7])
+
+
+class StartupRecovery:
+    """0x0A只告警；启动前继续零速等待，运行中保持周期收发。"""
+    def __init__(self, started, timeout):
+        self.deadline = started + timeout
+        self.clear = set()
+        self.ready = False
+        self.running = False
+
+    def observe(self, status):
+        fault, wheel = status['fault'], status['wheel']
+        if fault:
+            if fault == 0x0A:
+                self.clear.discard(wheel)
+                self.ready = False
+                return
+            label = 'CAN接收故障' if fault == 0x0A else '故障'
+            raise RuntimeError(f'{wheel}轮{label} 0x{fault:02X}')
+        self.clear.add(wheel)
+        self.ready = self.clear == {'左', '右'}
+
+    def check_timeout(self, now):
+        if not self.ready and now >= self.deadline:
+            raise RuntimeError('启动通信恢复超时：未收到左右轮均无故障的反馈，停止控制')
+
+    def begin_run(self, now, latest):
+        if now < self.deadline:
+            return False
+        # 已收到且持续刷新的0x0A反馈允许继续零速等待，不因观察结束退出。
+        if any(item[0] == 0x0A for item in latest.values()):
+            for wheel in ('左', '右'):
+                item = latest.get(wheel)
+                if item is None or now - item[1] > 1:
+                    raise RuntimeError(f'{wheel}轮反馈缺失或超过1秒未更新，停止控制')
+            return False
+        self.check_timeout(now)
+        for wheel in ('左', '右'):
+            item = latest.get(wheel)
+            if item is None or item[0] != 0 or now - item[1] > 1:
+                raise RuntimeError(f'观察结束：{wheel}轮未提供最近1秒内的无故障反馈，停止控制')
+        self.running = True
+        return True
+
+
+def prepare_usb_backend():
+    """提前加载并缓存后端，供 canalystii 内部 usb.core.find() 使用。"""
+    import usb.backend.libusb1
+    import usb.backend.libusb0
+
+    backend = usb.backend.libusb1.get_backend()
+    if backend is None:
+        try:
+            import libusb_package
+        except ImportError:
+            pass
+        else:
+            backend = usb.backend.libusb1.get_backend(
+                find_library=libusb_package.find_library)
+    if backend is None:
+        backend = usb.backend.libusb0.get_backend()
+    if backend is None:
+        if sys.platform.startswith('linux'):
+            raise RuntimeError('未找到libusb动态库，请执行 sudo apt install libusb-1.0-0；'
+                               '如提示权限不足，请按README配置udev规则。')
+        raise RuntimeError(
+            'PyUSB 找不到可用的 libusb DLL。请用运行脚本的同一个 Python 执行：\n'
+            '  python -m pip install --upgrade libusb-package\n'
+            '安装后仍失败，请检查 Python 与 DLL 的32/64位是否一致。')
+    return backend
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--mode', choices=['external', 'direct'], default='external')
+    p.add_argument('--left-rpm', type=float, default=0, help='减速后左轮转速rpm，编码前乘15.75')
+    p.add_argument('--right-rpm', type=float, default=0, help='减速后右轮转速rpm，编码前乘15.75')
+    p.add_argument('--left-direction', type=int, choices=[-1, 1], default=1,
+                   help='左轮安装方向系数，默认1')
+    p.add_argument('--right-direction', type=int, choices=[-1, 1], default=-1,
+                   help='右轮安装方向系数，默认-1，补偿镜像安装')
+    p.add_argument('--startup-only', action='store_true',
+                   help='仅零速通信诊断，故障清除后也不发送目标速度')
+    p.add_argument('--max-rpm', type=float, required=True,
+                   help='电机轴最高转速rpm（减速前）；external须与上控一致，direct写入配置帧')
+    p.add_argument('--duration', type=float, default=60, help='目标速度运行秒数，默认60，必须大于0')
+    p.add_argument('--period-ms', type=float, default=20, help='工程初值，协议未规定周期')
+    p.add_argument('--tx-timeout', type=float, default=0.1, help='发送队列等待秒数')
+    p.add_argument('--startup-timeout', type=float, default=10,
+                   help='固定零速观察秒数，提前清除也不提前运行，默认20，最大300')
+    p.add_argument('--channel', type=int, choices=[0, 1], default=0)
+    p.add_argument('--device', type=int, default=0)
+    p.add_argument('--backend', choices=['canalystii', 'controlcan'], default='canalystii')
+    p.add_argument('--library', '--dll', dest='dll',
+                   help='厂商ControlCAN.dll或libcontrolcan.so路径，默认按系统和架构选择')
+    p.add_argument('--torque', type=int, default=20)
+    p.add_argument('--depth', type=int, default=100)
+    p.add_argument('--battery', choices=['lithium', 'lead'], default='lithium')
+    p.add_argument('--swap', action='store_true')
+    p.add_argument('--pi', type=int, default=0)
+    p.add_argument('--left-comp', type=int, default=0)
+    p.add_argument('--right-comp', type=int, default=0)
+    p.add_argument('--overvoltage', type=int, default=33)
+    p.add_argument('--undervoltage', type=int, default=22)
+    p.add_argument('--brake-voltage', type=int, default=13)
+    p.add_argument('--send', action='store_true', help='实际连接CAN并发送')
+    a = p.parse_args(argv)
+    try:
+        bounded(a.duration, 0.001, 86400, '运行时间')
+        bounded(a.period_ms, 1, 1000, '发送周期ms')
+        bounded(a.tx_timeout, 0.001, 5, '发送等待秒数')
+        bounded(a.startup_timeout, 0.1, 300, '零速观察秒数')
+        bounded(a.device, 0, 255, '设备索引')
+        # 使用配置帧的0.1rpm精度作为换算基准。
+        bounded(a.max_rpm, 0.1, 6553.5, '最高转速')
+        max_rpm = round(a.max_rpm * 10) / 10
+        right = wheel_speed_raw(0 if a.startup_only else a.right_rpm, max_rpm, a.right_direction)
+        left = wheel_speed_raw(0 if a.startup_only else a.left_rpm, max_rpm, a.left_direction)
+        cfg = config_frame(max_rpm, a.battery, a.swap, a.pi,
+                           a.left_comp, a.right_comp, a.overvoltage,
+                           a.undervoltage, a.brake_voltage)
+        cmd = control_frame(right, left, a.torque, a.depth)
+        if a.mode == 'external':
+            frames = [(0x108, external_frame(right, left))]
+            # 先保持功能开启发送零速，再关闭外部功能。
+            zero = [(0x108, external_frame(0, 0))]
+            off = [(0x108, external_frame(0, 0, False))]
+        else:
+            frames = [(0x103, cmd), (0x103, cfg)]
+            zero = [(0x103, control_frame(0, 0, a.torque, a.depth)), (0x103, cfg)]
+            off = [(0x103, control_frame(0, 0, 0, 0, False)), (0x103, cfg)]
+    except ValueError as exc:
+        p.error(str(exc))
+    if a.startup_only:
+        frames = zero
+        print('仅零速诊断模式：忽略目标速度，故障清除后继续保持零速。')
+    else:
+        print(f'轮端目标rpm：左={a.left_rpm:g}，右={a.right_rpm:g}；'
+              f'减速比={GEAR_RATIO:g}；电机轴指令rpm：'
+              f'左={a.left_rpm * GEAR_RATIO * a.left_direction:g}，'
+              f'右={a.right_rpm * GEAR_RATIO * a.right_direction:g}')
+    for can_id, payload in frames:
+        print(f'待发送 标准帧 ID=0x{can_id:03X} DLC=8 DATA={payload.hex(" ").upper()}')
+    if not a.send:
+        print('仅预览。加入 --send 后发送；首次调试请架空驱动轮。')
+        return 0
+    try:
+        import can
+    except (ImportError, RuntimeError) as exc:
+        print(f'USB后端准备失败，未发送指令：{exc}', file=sys.stderr)
+        return 1
+    period = a.period_ms / 1000
+    try:
+        from controlcan_backend import open_bus
+        bus = open_bus(a.backend, a.channel, a.device, a.dll)
+    except Exception as exc:
+        print(f'CAN接口打开失败，未发送指令：{exc}\n'
+              '请检查USB连接、设备索引、设备驱动，并关闭占用设备的厂商软件。\n'
+              'Ubuntu需检查libusb依赖和udev权限；Windows需匹配USB驱动，详见README。', file=sys.stderr)
+        return 1
+
+    def transmit(batch):
+        for can_id, payload in batch:
+            bus.send(can.Message(arbitration_id=can_id, data=payload,
+                                 is_extended_id=False, channel=a.channel), timeout=a.tx_timeout)
+
+    result = 0
+    try:
+        started = time.monotonic()
+        recovery = StartupRecovery(started, a.startup_timeout)
+        deadline = started + a.startup_timeout if a.startup_only else None
+        next_send = started
+        last_print = {}
+        latest = {}
+        next_summary = started
+        print(f'零速观察{a.startup_timeout:g}秒：持续发送使能零速及配置，'
+              '接收左右轮反馈；即使故障提前清除也不提前运行。')
+        for can_id, payload in zero:
+            print(f'启动发送 ID=0x{can_id:03X} DATA={payload.hex(" ").upper()}')
+        while deadline is None or time.monotonic() < deadline:
+            transmit(frames if recovery.running and not a.startup_only else zero)
+            next_send += period
+            # 非阻塞读取，限制单周期数量，避免繁忙总线饿死发送。
+            for _ in range(100):
+                msg = bus.recv(timeout=0)
+                if msg is None:
+                    break
+                if msg.is_extended_id or msg.is_remote_frame or msg.is_error_frame:
+                    continue
+                status = parse_feedback(msg.arbitration_id, msg.data)
+                if status:
+                    now = time.monotonic()
+                    latest[status['wheel']] = (status['fault'], now)
+                    previous = last_print.get(status['wheel'])
+                    if previous is None or previous[0] != status['fault'] or now - previous[1] >= 0.5:
+                        fault = status['fault']
+                        label = ('无故障' if fault == 0 else
+                                 'CAN接收故障告警，继续收发不退出' if fault == 0x0A else '其他故障')
+                        if fault == 0 and previous is not None and previous[0] == 0x0A:
+                            label = '无故障，0x0A已清除'
+                        print(f'RX ID=0x{msg.arbitration_id:03X} {status["wheel"]}轮 '
+                              f'DATA={msg.data.hex(" ").upper()} '
+                              f'故障=0x{fault:02X}（{label}） '
+                              f'速度原始值={status["speed_raw"]}')
+                        last_print[status['wheel']] = (status['fault'], now)
+                    if not a.startup_only or status['fault'] not in (0, 0x0A):
+                        recovery.observe(status)
+            now = time.monotonic()
+            if not a.startup_only and deadline is None and recovery.begin_run(now, latest):
+                deadline = now + a.duration
+                print(f'零速观察结束，左右轮最新反馈无故障；开始目标速度控制，运行{a.duration:g}秒。')
+            if (a.startup_only or not recovery.running) and now >= next_summary:
+                states = []
+                for wheel in ('左', '右'):
+                    item = latest.get(wheel)
+                    if item is None:
+                        state = '尚未收到反馈'
+                    else:
+                        fault, received = item
+                        state = f'最近故障码0x{fault:02X}，距今{now - received:.1f}秒'
+                    states.append(f'{wheel}轮：{state}')
+                print(f'{"零速诊断" if a.startup_only else "启动等待"}，剩余{max(0, recovery.deadline - now):.1f}秒；'
+                      + '；'.join(states))
+                next_summary = now + 1
+            if next_send < now:
+                next_send = now  # 不补发积压的运动指令
+            limit = deadline if deadline is not None else max(recovery.deadline, next_send)
+            time.sleep(max(0, min(next_send, limit) - now))
+        if a.startup_only:
+            print('零速诊断结束，发送零速及失能帧；未发送目标速度指令。')
+    except KeyboardInterrupt:
+        print('收到中断，发送零速并关闭控制。')
+    except can.CanTimeoutError as exc:
+        result = 1
+        print(f'发送队列等待超时：{exc}\n'
+              f'当前 device={a.device}, channel={a.channel}, bitrate=500000。\n'
+              '尚不能确认指令是否执行。请先运行 can_diagnose.py 检查接收，'
+              '再核对接线、供电、终端及驱动兼容性。', file=sys.stderr)
+    except Exception as exc:
+        result = 1
+        print(f'运行失败：{exc}', file=sys.stderr)
+    finally:
+        # 每次独立尝试，发送失败不能阻止后续停止帧或关闭USB。
+        try:
+            stop_errors = []
+            for batch in (zero,) * 5 + (off,) * 5:
+                try:
+                    transmit(batch)
+                except Exception as exc:
+                    stop_errors.append(str(exc))
+                time.sleep(period)
+            if stop_errors:
+                result = 1
+                print(f'停止帧发送失败 {len(stop_errors)}/10 组：{stop_errors[0]}。'
+                      '无法确认电机停止，请使用硬件急停。', file=sys.stderr)
+        finally:
+            bus.shutdown()
+    return result
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

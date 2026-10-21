@@ -1,0 +1,2 @@
+# CANalyst-II USB access for local desktop users and members of plugdev.
+SUBSYSTEM=="usb", ATTR{idVendor}=="04d8", ATTR{idProduct}=="0053", GROUP="plugdev", MODE="0660", TAG+="uaccess"
