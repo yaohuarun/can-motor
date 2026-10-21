@@ -126,10 +126,16 @@ class ControlCanBus:
 
 
 def open_bus(backend, channel, device, dll_path=None):
+    if backend == 'pcan':
+        import can
+        # PEAK's Windows driver exposes channels by symbolic names.  Keeping the
+        # name visible here also lets multi-channel adapters select USBBUS2, etc.
+        pcan_channel = channel or 'PCAN_USBBUS1'
+        return can.Bus(interface='pcan', channel=pcan_channel, bitrate=500000)
     if backend == 'controlcan':
-        return ControlCanBus(channel, device, dll_path)
+        return ControlCanBus(int(channel or 0), device, dll_path)
     import can
     from motor_control import prepare_usb_backend
     prepare_usb_backend()
-    return can.Bus(interface='canalystii', channel=channel, device=device,
+    return can.Bus(interface='canalystii', channel=int(channel or 0), device=device,
                    bitrate=500000, ignore_config=True)

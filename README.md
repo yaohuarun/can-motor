@@ -1,9 +1,36 @@
-# CANalyst-II 电动轮椅电机速度控制
+# PEAK PCAN 电动轮椅电机速度控制
 
 依据 `D:\work\doc\电动轮椅CAN通讯协议通用解密版.pdf` 第2～7页编写，Python 3.10+。
-使用 python-can 的 canalystii 后端，500 kbit/s、标准数据帧、8字节数据。
+默认使用 python-can 的 PCAN 后端和 PEAK-System Windows 驱动，500 kbit/s、标准数据帧、8字节数据。
 
-## Ubuntu运行（Python 3.10+）
+## Windows / PEAK PCAN 安装
+
+1. 解压并运行 `D:\BaiduNetdiskDownload\PCAN\驱动\win\PEAK-System_Driver-Setup.zip`
+   内的 `PeakOemDrv.exe`，安装 PEAK-System 设备驱动。
+2. 接入 PCAN-USB，确认设备管理器能识别设备；关闭 PCAN-View 等占用同一通道的软件。
+3. 安装 Python 依赖并先做只接收诊断：
+
+```powershell
+python -m pip install -r requirements.txt
+python can_diagnose.py --seconds 5
+```
+
+默认通道是 `PCAN_USBBUS1`。多通道或多个适配器可显式指定，例如
+`--channel PCAN_USBBUS2`。确认接收、接线和安全措施后再添加 `--send`：
+
+```powershell
+# 预览，不连接设备
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0
+# 实际发送；首次测试请使用很低速度和很短时间
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.02 --angular-speed 0 --duration 1 --send
+```
+
+`PeakOemDrv.exe` 是系统驱动安装程序，不复制进项目，也不通过 `--library` 加载。
+python-can 的 `pcan` 接口会调用驱动安装的 PCAN-Basic 运行库。
+
+## 旧 CANalyst-II 后端（保留兼容）
+
+### Ubuntu运行（Python 3.10+）
 
 将整个项目目录复制到Ubuntu（包含 `libs/linux`），进入项目目录执行：
 
@@ -70,7 +97,7 @@ python can_diagnose.py --backend canalystii --channel 0 --seconds 5
 不能用接收成功代替发送成功。当前只在Windows环境完成自动测试和Linux库ELF架构检查，
 尚未在Ubuntu与电机实物上验证。
 
-## 安装和接线
+## 参数和接线
 
 ### 差速速度参数（ROS 2 约定）
 
@@ -118,9 +145,10 @@ python motor_control.py --max-rpm 300 --linear-speed 0 --angular-speed 0.2
 python -m pip install -r requirements.txt
 ```
 
-该后端采用 canalystii 的 USB 用户态驱动；Windows 需配置 libusb-win32，
+旧 `canalystii` 后端采用 USB 用户态驱动；Windows 需配置 libusb-win32，
 参考 [python-can 官方文档](https://python-can.readthedocs.io/en/stable/interfaces/canalystii.html)。
-`--backend canalystii` 为开源USB后端，`--backend controlcan` 为厂商DLL/SO后端。
+默认 `--backend pcan` 为 PEAK-System 后端；`--backend canalystii` 为旧开源USB后端，
+`--backend controlcan` 为旧厂商DLL/SO后端。
 更换USB驱动可能影响厂商上位机，先确认设备型号和原驱动。
 
 ### `usb.core.NoBackendError: No backend available`
@@ -149,7 +177,8 @@ python -c "from motor_control import prepare_usb_backend; print(prepare_usb_back
 
 将所选通道 CAN_H、CAN_L 接入控制总线，按设备要求连接参考地。
 确认总线两端各有120Ω终端电阻，不要在已有终端的总线上重复添加。
-`--channel 0` 为第一路，`--channel 1` 为第二路；`--device 0` 为首个USB设备。
+PCAN 使用 `--channel PCAN_USBBUS1`（默认）或 `PCAN_USBBUS2` 等驱动通道名。
+旧后端的 `--channel 0` 为第一路、`--channel 1` 为第二路，`--device 0` 为首个USB设备。
 首次测试请架空驱动轮、移开乘员并准备硬件急停。脚本退出时会尝试停止，USB断开或总线故障时无法保证停止。
 
 ## 保留原上位控制器：external 模式
@@ -246,7 +275,7 @@ external模式发送零速外部控制帧，配置仍由原上控负责。
   启动期间0x0A按上文恢复流程处理。第6页“以15位数据为标幺值”描述不够明确，电流单位也未给出，因此没有把反馈强行换算成RPM或安培。
 - 外部模式没有直接控制转矩或写入最高转速的权限，实际动作还取决于原上控策略。
   收不到反馈不会被解释为已运行；发送成功也不等于电机执行成功。
-- 软件未在CANalyst-II及电机实物上验证；默认不发送，需显式指定 `--send`。
+- 软件未在PCAN及电机实物上验证；默认不发送，需显式指定 `--send`。
 
 ## 检查
 
@@ -286,9 +315,9 @@ python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linea
 以下仅接收，不发送应用层CAN控制报文（普通模式仍自动ACK，不是硬件静默模式）：
 
 ```powershell
-python can_diagnose.py --channel 0 --seconds 5
-# 如果实际接的是第二路
-python can_diagnose.py --channel 1 --seconds 5
+python can_diagnose.py --seconds 5
+# 如果实际使用第二个PCAN通道
+python can_diagnose.py --channel PCAN_USBBUS2 --seconds 5
 ```
 
 收到101/102说明能接收驱动反馈，103说明看到上控报文，10A为上控摇杆数据。

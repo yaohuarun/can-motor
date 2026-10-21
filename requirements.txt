@@ -1,2 +1,2 @@
-python-can[canalystii]>=4.4,<5
+python-can[canalystii]>=4.4,<5  # includes the PCAN interface; PEAK driver is installed separately
 libusb-package>=1.0.26; sys_platform == "win32"

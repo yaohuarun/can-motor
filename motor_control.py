@@ -177,9 +177,10 @@ def main(argv=None):
     p.add_argument('--tx-timeout', type=float, default=0.1, help='发送队列等待秒数')
     p.add_argument('--startup-timeout', type=float, default=5,
                    help='固定零速观察秒数，提前清除也不提前运行，默认5，最大300')
-    p.add_argument('--channel', type=int, choices=[0, 1], default=0)
+    p.add_argument('--channel', default=None,
+                   help='PCAN通道名（默认PCAN_USBBUS1）；旧后端使用0或1')
     p.add_argument('--device', type=int, default=0)
-    p.add_argument('--backend', choices=['canalystii', 'controlcan'], default='canalystii')
+    p.add_argument('--backend', choices=['pcan', 'canalystii', 'controlcan'], default='pcan')
     p.add_argument('--library', '--dll', dest='dll',
                    help='厂商ControlCAN.dll或libcontrolcan.so路径，默认按系统和架构选择')
     p.add_argument('--torque', type=int, default=20)
@@ -200,6 +201,8 @@ def main(argv=None):
         bounded(a.tx_timeout, 0.001, 5, '发送等待秒数')
         bounded(a.startup_timeout, 0.1, 300, '零速观察秒数')
         bounded(a.device, 0, 255, '设备索引')
+        if a.backend != 'pcan' and a.channel not in (None, '0', '1'):
+            raise ValueError('canalystii/controlcan 的通道必须为0或1')
         # 使用配置帧的0.1rpm精度作为换算基准。
         bounded(a.max_rpm, 0.1, 6553.5, '最高转速')
         max_rpm = round(a.max_rpm * 10) / 10
@@ -240,7 +243,7 @@ def main(argv=None):
     try:
         import can
     except (ImportError, RuntimeError) as exc:
-        print(f'USB后端准备失败，未发送指令：{exc}', file=sys.stderr)
+        print(f'CAN后端准备失败，未发送指令：{exc}', file=sys.stderr)
         return 1
     period = a.period_ms / 1000
     try:
