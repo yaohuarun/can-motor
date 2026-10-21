@@ -8,6 +8,23 @@ import sys
 import time
 
 GEAR_RATIO = 15.75
+WHEEL_DIAMETER_M = 0.254
+TRACK_WIDTH_M = 0.420
+
+
+def differential_wheel_rpm(linear_speed: float, angular_speed: float):
+    """车体 m/s、rad/s 转为左、右轮端 rpm，前进和逆时针为正。"""
+    for value, name in ((linear_speed, '线速度m/s'),
+                        (angular_speed, '角速度rad/s')):
+        if not math.isfinite(value):
+            raise ValueError(f'{name} 必须为有限数值')
+    turn_speed = angular_speed * (TRACK_WIDTH_M / 2)
+    factor = 60 / (math.pi * WHEEL_DIAMETER_M)
+    left = (linear_speed - turn_speed) * factor
+    right = (linear_speed + turn_speed) * factor
+    if not all(math.isfinite(value) for value in (left, right)):
+        raise ValueError('差速换算结果必须为有限数值，目标速度过大')
+    return left, right
 
 
 def bounded(value, low, high, name):
@@ -143,12 +160,14 @@ def prepare_usb_backend():
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=['external', 'direct'], default='external')
-    p.add_argument('--left-rpm', type=float, default=0, help='减速后左轮转速rpm，编码前乘15.75')
-    p.add_argument('--right-rpm', type=float, default=0, help='减速后右轮转速rpm，编码前乘15.75')
-    p.add_argument('--left-direction', type=int, choices=[-1, 1], default=1,
-                   help='左轮安装方向系数，默认1')
-    p.add_argument('--right-direction', type=int, choices=[-1, 1], default=-1,
-                   help='右轮安装方向系数，默认-1，补偿镜像安装')
+    p.add_argument('--linear-speed', type=float, default=0,
+                   help='车体线速度m/s，前进为正，默认0')
+    p.add_argument('--angular-speed', type=float, default=0,
+                   help='车体角速度rad/s，俯视逆时针左转为正，默认0')
+    p.add_argument('--left-direction', type=int, choices=[-1, 1], default=-1,
+                   help='左轮安装方向系数，默认-1，按实车前进方向校准')
+    p.add_argument('--right-direction', type=int, choices=[-1, 1], default=1,
+                   help='右轮安装方向系数，默认1，补偿镜像安装')
     p.add_argument('--startup-only', action='store_true',
                    help='仅零速通信诊断，故障清除后也不发送目标速度')
     p.add_argument('--max-rpm', type=float, required=True,
@@ -156,8 +175,8 @@ def main(argv=None):
     p.add_argument('--duration', type=float, default=60, help='目标速度运行秒数，默认60，必须大于0')
     p.add_argument('--period-ms', type=float, default=20, help='工程初值，协议未规定周期')
     p.add_argument('--tx-timeout', type=float, default=0.1, help='发送队列等待秒数')
-    p.add_argument('--startup-timeout', type=float, default=10,
-                   help='固定零速观察秒数，提前清除也不提前运行，默认20，最大300')
+    p.add_argument('--startup-timeout', type=float, default=5,
+                   help='固定零速观察秒数，提前清除也不提前运行，默认5，最大300')
     p.add_argument('--channel', type=int, choices=[0, 1], default=0)
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--backend', choices=['canalystii', 'controlcan'], default='canalystii')
@@ -184,8 +203,11 @@ def main(argv=None):
         # 使用配置帧的0.1rpm精度作为换算基准。
         bounded(a.max_rpm, 0.1, 6553.5, '最高转速')
         max_rpm = round(a.max_rpm * 10) / 10
-        right = wheel_speed_raw(0 if a.startup_only else a.right_rpm, max_rpm, a.right_direction)
-        left = wheel_speed_raw(0 if a.startup_only else a.left_rpm, max_rpm, a.left_direction)
+        left_rpm, right_rpm = differential_wheel_rpm(
+            0 if a.startup_only else a.linear_speed,
+            0 if a.startup_only else a.angular_speed)
+        right = wheel_speed_raw(right_rpm, max_rpm, a.right_direction)
+        left = wheel_speed_raw(left_rpm, max_rpm, a.left_direction)
         cfg = config_frame(max_rpm, a.battery, a.swap, a.pi,
                            a.left_comp, a.right_comp, a.overvoltage,
                            a.undervoltage, a.brake_voltage)
@@ -205,10 +227,11 @@ def main(argv=None):
         frames = zero
         print('仅零速诊断模式：忽略目标速度，故障清除后继续保持零速。')
     else:
-        print(f'轮端目标rpm：左={a.left_rpm:g}，右={a.right_rpm:g}；'
+        print(f'车体目标：线速度={a.linear_speed:g} m/s，角速度={a.angular_speed:g} rad/s')
+        print(f'轮端目标rpm：左={left_rpm:g}，右={right_rpm:g}；'
               f'减速比={GEAR_RATIO:g}；电机轴指令rpm：'
-              f'左={a.left_rpm * GEAR_RATIO * a.left_direction:g}，'
-              f'右={a.right_rpm * GEAR_RATIO * a.right_direction:g}')
+              f'左={left_rpm * GEAR_RATIO * a.left_direction:g}，'
+              f'右={right_rpm * GEAR_RATIO * a.right_direction:g}')
     for can_id, payload in frames:
         print(f'待发送 标准帧 ID=0x{can_id:03X} DLC=8 DATA={payload.hex(" ").upper()}')
     if not a.send:

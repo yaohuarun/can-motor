@@ -10,6 +10,13 @@ from motor_control import main
 
 class StartupOnlyTests(unittest.TestCase):
     def test_zero_speed_even_when_fault_clears_and_returns(self):
+        for mode in ('direct', 'external'):
+            for linear, angular in (('0.01', '0.02'), ('1000', '1000'),
+                                    ('nan', 'inf'), ('-inf', 'nan')):
+                with self.subTest(mode=mode, linear=linear, angular=angular):
+                    self.check_zero_speed(mode, linear, angular)
+
+    def check_zero_speed(self, mode, linear, angular):
         bus = Mock()
         feedback = []
         for fault in (0x0A, 0, 0x0A):
@@ -26,8 +33,9 @@ class StartupOnlyTests(unittest.TestCase):
         with patch.dict(sys.modules, {'can': can}), \
                 patch('controlcan_backend.open_bus', return_value=bus), \
                 contextlib.redirect_stdout(output):
-            result = main(['--backend', 'controlcan', '--mode', 'direct',
-                           '--max-rpm', '100', '--left-rpm', '10', '--right-rpm', '10',
+            result = main(['--backend', 'controlcan', '--mode', mode,
+                           '--max-rpm', '100', f'--linear-speed={linear}',
+                           f'--angular-speed={angular}',
                            '--startup-only', '--startup-timeout', '0.1', '--send'])
         self.assertEqual(result, 0)
         self.assertIn('0x0A已清除', output.getvalue())

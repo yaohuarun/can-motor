@@ -34,12 +34,12 @@ sudo udevadm trigger --subsystem-match=usb
 # 接收诊断，不发送控制报文
 python can_diagnose.py --backend controlcan --channel 0 --seconds 5
 # 先预览，不连接设备
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --left-rpm 10 --right-rpm 10
-# 零速观察20秒，无故障后以目标速度运行60秒
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --left-rpm 10 --right-rpm 10 --startup-timeout 20 --duration 60 --send
+python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0
+# 零速观察5秒，无故障后以目标速度运行60秒
+python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 --startup-timeout 5 --duration 60 --send
 ```
 
-默认左轮方向+1、右轮-1以及所有配置参数保持原有设置。
+按实车方向校准，默认左轮方向-1、右轮+1，正线速度对应前进。
 启动观察期间仍发送零速使能和配置；目标速度前不会提前运行，结束发送零速和失能。
 
 `controlcan` 在Linux使用 `ctypes.CDLL` 加载厂商SO（cdecl），
@@ -72,16 +72,47 @@ python can_diagnose.py --backend canalystii --channel 0 --seconds 5
 
 ## 安装和接线
 
-### 速度参数单位（减速比15.75）
+### 差速速度参数（ROS 2 约定）
 
-`--left-rpm`、`--right-rpm` 现在均为减速后的轮端转速。编码之前先乘15.75得到电机轴转速，
-再应用左右安装方向系数，最后换算为协议比例值：
-`raw = round(wheel_rpm * 15.75 * direction / max_motor_rpm * 16384)`。
-`--max-rpm` 仍为减速前电机轴最高转速，配置帧的0.1rpm单位保持原协议定义。
-例如轮端10rpm对应电机轴157.5rpm；设置最高转速300rpm时，指令为左+8602、右-8602。
-换算后的电机轴转速超过 `--max-rpm` 时程序报错，不截断速度。
-原来 `--max-rpm 10 --left-rpm 10 --right-rpm 10` 的命令现在不适用：10rpm轮速需要157.5rpm电机轴速度。
-请按电机实际规格设置最高转速；该值不是乘减速比后的轮端上限。
+`--linear-speed` 为车体线速度，单位 **m/s**，正值前进；`--angular-speed` 为车体角速度，
+单位 **rad/s**，正值表示从上往下看逆时针左转。两者均默认0。
+这里采用 ROS 2 的速度语义，程序仍为命令行工具，不订阅 ROS 2 话题。
+
+固定几何参数为轮径 **254 mm（D=0.254 m）**、两轮中心距 **420 mm（B=0.420 m）**，
+减速比为 **15.75**。设线速度为v、角速度为ω：
+
+```text
+左轮线速度 = v − ω × B/2 = v − ω × 0.21
+右轮线速度 = v + ω × B/2 = v + ω × 0.21
+轮端rpm = 轮线速度 × 60 / (π × D)
+电机轴rpm = 轮端rpm × 15.75 × 安装方向系数
+raw = round(电机轴rpm / max_motor_rpm × 16384)
+```
+
+前进直行时两轮轮端rpm均为正，默认安装方向使左电机轴为负、右为正。
+原地左转（v=0、ω>0）时左轮倒转、右轮前转，安装补偿后两个电机轴指令均为正。
+例如 v=0.1 m/s、ω=0 对应每轮约7.51913 rpm、电机轴约118.426 rpm。
+任一轮换算后超过 `--max-rpm` 或正常运动目标含NaN/无穷/换算溢出时，程序在连接设备前报错，
+不截断或缩放速度。转弯需要分别核对两轮速度。
+`--max-rpm` 仍为减速前电机轴最高转速，按配置帧0.1 rpm精度量化后用于编码；请按硬件实际参数设置。
+
+#### 旧参数迁移
+
+`--left-rpm`、`--right-rpm` 已移除，旧调用会报参数错误。旧左右轮端转速nL、nR（rpm）可换算为：
+`v=πD(nL+nR)/120`，`ω=πD(nR−nL)/(60B)`，不包含安装方向系数。
+例如左右轮端均10 rpm对应 `--linear-speed 0.132994889 --angular-speed 0`。
+最高转速、安装方向和其他硬件配置参数保持原有含义。
+
+以下为运动预览，不连接设备：
+
+```powershell
+# 直行0.1 m/s
+python motor_control.py --max-rpm 300 --linear-speed 0.1 --angular-speed 0
+# 以0.1 m/s前进并以0.2 rad/s左转
+python motor_control.py --max-rpm 300 --linear-speed 0.1 --angular-speed 0.2
+# 以0.2 rad/s原地左转；负角速度为右转
+python motor_control.py --max-rpm 300 --linear-speed 0 --angular-speed 0.2
+```
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -128,15 +159,15 @@ python -c "from motor_control import prepare_usb_backend; print(prepare_usb_back
 以下300 rpm仅为示例，请替换为实际参数。
 
 ```powershell
-# 预览左右轮端各2 rpm的报文，不连接设备
-python motor_control.py --max-rpm 300 --left-rpm 2 --right-rpm 2
+# 预览0.02 m/s直行的报文，不连接设备
+python motor_control.py --max-rpm 300 --linear-speed 0.02 --angular-speed 0
 # 实际运行5秒，结束时发送零速，再关闭外部功能
-python motor_control.py --max-rpm 300 --left-rpm 2 --right-rpm 2 --duration 5 --send
+python motor_control.py --max-rpm 300 --linear-speed 0.02 --angular-speed 0 --duration 5 --send
 # 反转（方向由安装方式决定）
-python motor_control.py --max-rpm 300 --left-rpm -2 --right-rpm -2 --send
+python motor_control.py --max-rpm 300 --linear-speed=-0.02 --angular-speed 0 --send
 ```
 
-示例报文：`0x108: F9 48 06 B8 05 00 00 00`。
+示例报文：`0x108: 05 0E FA F2 05 00 00 00`。
 字节顺序为右轮速度、左轮速度（各2字节，大端有符号），速度功能使能05，X=0，Y=0，模拟摇杆关闭00。
 退出时关闭外部功能可能恢复原摇杆控制，因此必须确保原摇杆处于中位。
 
@@ -147,13 +178,13 @@ python motor_control.py --max-rpm 300 --left-rpm -2 --right-rpm -2 --send
 
 ```powershell
 # 先预览；核对配置后添加 --send
-python motor_control.py --mode direct --max-rpm 300 --left-rpm 2 --right-rpm 2 --torque 20 --battery lithium --overvoltage 33 --undervoltage 22 --brake-voltage 13
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.02 --angular-speed 0 --torque 20 --battery lithium --overvoltage 33 --undervoltage 22 --brake-voltage 13
 ```
 
 以上例子产生：
 
 ```text
-0x103: F9 48 06 B8 14 64 00 0D
+0x103: 05 0E FA F2 14 64 00 0D
 0x103: B8 0B 00 00 21 16 0D AA
 ```
 
@@ -174,12 +205,12 @@ python motor_control.py --backend controlcan --mode direct --max-rpm 100 --start
 
 该模式持续60秒发送零速使能＋配置帧并接收反馈，显示原始报文、故障码和每秒汇总。
 0x0A清除或再次出现时均继续零速观察，不会进入目标速度运行；其他故障仍停止。
-左右目标速度参数会被强制忽略为0。Ctrl+C可提前结束，退出时发送零速和失能帧。
+线速度与角速度参数会被强制忽略为0（包括可解析但超速或非有限的值）。Ctrl+C可提前结束，退出时发送零速和失能帧。
 `--duration`不用于此模式，观察时长由`--startup-timeout`决定。
 零速使能仍可能释放电机制动器，请固定轮椅、架空驱动轮。
 
 用户已确认该固件反馈 `0x0A` 表示CAN接收故障，按此定义处理。
-启动后先以零速使能持续发送（direct模式同时发送配置帧），默认固定观察20秒。
+启动后先以零速使能持续发送（direct模式同时发送配置帧），默认固定观察5秒。
 即使0x0A提前清除，也必须等待完整观察时间；期间持续打印原始反馈和故障状态。
 观察结束时，只有左右轮最近1秒内均有无故障反馈，才发送目标速度并开始计算 `--duration`。
 观察结束仍有0x0A时不退出，持续发送零速和配置、接收反馈，直到左右轮反馈均恢复正常再运行。
@@ -189,16 +220,16 @@ python motor_control.py --backend controlcan --mode direct --max-rpm 100 --start
 `--startup-timeout 3` 可将固定观察时间调整为3秒（允许0.1～300秒）。
 
 ```powershell
-# 固定零速观察20秒，再以左右各10rpm运行1分钟（均为默认时长）
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --left-rpm 10 --right-rpm 10 --startup-timeout 20 --duration 60 --send
+# 显式零速观察5秒，再以0.1 m/s直行1分钟
+python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 --startup-timeout 5 --duration 60 --send
 ```
 
 零速使能期间可能释放电磁刹车，应固定车体防止溜车。正负速度与实际前进方向的对应取决于电机安装与接线。
 
-当前默认安装方向系数为左轮+1、右轮-1：同为正的左右轮目标速度将生成左正右负的电机指令，
-补偿两轮镜像安装。参数单位仍为rpm，反馈速度保持协议原始符号。
-可用 `--left-direction -1 --right-direction 1` 同时反转物理行进方向，
-或用 `--right-direction 1` 恢复原来的右轮指令方向。首次调整后请架空确认实际前进方向。
+当前默认安装方向系数为左轮-1、右轮+1：正线速度、零角速度将生成左负右正的电机指令，
+补偿两轮镜像安装。输入单位为m/s和rad/s，反馈速度保持协议原始符号。
+可用 `--left-direction 1 --right-direction -1` 恢复此前的方向设置。
+默认方向已依据实车正线速度原先后退的结果反转；调整后请架空确认前进及左转方向。
 external模式发送零速外部控制帧，配置仍由原上控负责。
 反馈输出按每轮0.5秒限频，故障变化立即输出，避免约1000帧/秒的反馈刷屏拖慢发送。
 日志显示反馈ID、8字节原始数据、十六进制故障码和0x0A清除状态；每秒汇总左右轮
@@ -206,7 +237,7 @@ external模式发送零速外部控制帧，配置仍由原上控负责。
 这只是等待通信恢复，不发送未在协议中定义的“故障清除”指令。
 
 - 速度换算：`raw = round(rpm / max_rpm * 16384)`，范围±16384，超范围报错。最高转速按0.1 rpm精度量化。
-  这是依据第4页比例说明进行的换算，实际转速需反馈/测速验证；此公式中的rpm为轮端输入乘以15.75后的电机轴转速。
+  这是依据第4页比例说明进行的换算，实际转速需反馈/测速验证；此公式中的rpm为差速换算后轮端rpm乘以15.75及安装方向系数的电机轴转速。
 - 协议没有规定周期、帧间延时、应答握手或通信超时停车行为。默认20 ms是可调试初值，用 `--period-ms` 修改。
 - 协议按发送节点列出0x103，未单独指定配置帧ID，也没有给出双帧识别状态机。
   direct 模式据此让两帧共用0x103、控制帧在前，配置帧以AA结尾；这是需要实机抓包核对的解释。
@@ -233,7 +264,7 @@ external模式发送零速外部控制帧，配置仍由原上控负责。
 # 先验证厂商路径能接收到原有101/102反馈
 python can_diagnose.py --backend controlcan --channel 0 --seconds 5
 # 核对硬件配置并架空驱动轮后，再进行短时控制测试
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --left-rpm 2 --right-rpm 2 --duration 1 --send
+python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.02 --angular-speed 0 --duration 1 --send
 ```
 
 可用 `--dll "完整路径\ControlCAN.dll"` 指定其他同型号SDK。
@@ -271,4 +302,5 @@ python -m unittest -v
 python motor_control.py --help
 ```
 
-测试覆盖正负速度字节序、配置位域、停止帧、越界输入及反馈解码，不需要连接硬件或安装python-can。
+测试覆盖差速直行/倒车/转弯/原地旋转、安装方向、最高转速边界、无效输入、零速诊断、
+正负速度字节序、配置位域、停止帧及反馈解码，不需要连接硬件或安装python-can。
