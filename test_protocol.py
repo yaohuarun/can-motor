@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from motor_control import (config_frame, control_frame, external_frame,
                            parse_feedback, speed_raw, wheel_speed_raw, StartupRecovery, main,
-                           differential_wheel_rpm)
+                           differential_wheel_rpm, format_feedback,
+                           should_print_feedback, feedback_speed_rpm,
+                           battery_level, feedback_target_rpm)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -182,11 +184,80 @@ class ProtocolTests(unittest.TestCase):
             control_frame(16385, 0)
 
     def test_feedback(self):
-        status = parse_feedback(0x101, bytes.fromhex('C0 00 00 20 10 66 00 01'))
-        self.assertEqual(status['speed_raw'], -16384)
-        self.assertEqual(status['fault'], 0x10)
-        self.assertIsNone(parse_feedback(0x103, bytes(8)))
-        self.assertIsNone(parse_feedback(0x101, bytes(7)))
+        left = parse_feedback(0x101, bytes.fromhex('C0 00 00 20 10 66 AB 01'))
+        self.assertEqual(left, dict(wheel='左', speed_raw=-16384,
+                                    current_raw=32, fault=0x10,
+                                    battery_raw=0x66, extra=0xAB,
+                                    revolutions=1))
+
+        right = parse_feedback(0x102, bytes.fromhex('7F FF FF FE 0A 80 CD FF'))
+        self.assertEqual(right, dict(wheel='右', speed_raw=32767,
+                                     current_raw=65534, fault=0x0A,
+                                     battery_raw=0x80, extra=0xCD,
+                                     revolutions=255))
+
+        for can_id, payload in ((0x100, bytes(8)), (0x103, bytes(8)),
+                                (0x101, bytes(7)), (0x102, bytes(9))):
+            with self.subTest(can_id=can_id, payload_length=len(payload)):
+                self.assertIsNone(parse_feedback(can_id, payload))
+
+    def test_feedback_console_line_contains_all_reported_values(self):
+        cases = (
+            ('00 01 00 02 00 03 04 05', None,
+             ('速度=0.0 rpm', 'Q轴电流原始值=2', '故障=0x00（无故障）',
+              '电池电量=未知等级（原始值=3）', '运行圈数=5')),
+            ('FF FF 00 20 0A 66 AB 01', None,
+             ('速度=0.0 rpm', 'Q轴电流原始值=32',
+              '故障=0x0A（CAN接收故障告警，继续收发不退出）',
+              '电池电量=放电，100%', '运行圈数=1')),
+            ('00 02 00 03 10 04 05 06', None,
+             ('速度=0.0 rpm', 'Q轴电流原始值=3', '故障=0x10（其他故障）',
+              '电池电量=未知等级（原始值=4）', '运行圈数=6')),
+            ('00 01 00 02 00 03 04 05', 0x0A,
+             ('故障=0x00（无故障，0x0A已清除）',)),
+        )
+        for raw, previous_fault, expected_parts in cases:
+            with self.subTest(raw=raw, previous_fault=previous_fault):
+                data = bytes.fromhex(raw)
+                status = parse_feedback(0x101, data)
+                line = format_feedback(0x101, data, status, 150, 300, previous_fault)
+                self.assertIn('RX ID=0x101 左轮', line)
+                self.assertIn(f'DATA={raw}', line)
+                self.assertIn('目标转速=150.0 rpm 速度=', line)
+                for part in expected_parts:
+                    self.assertIn(part, line)
+
+    def test_feedback_speed_uses_configured_motor_maximum(self):
+        self.assertEqual(feedback_speed_rpm(16384, 300), 300)
+        self.assertEqual(feedback_speed_rpm(-16384, 300), -300)
+        self.assertEqual(feedback_speed_rpm(8192, 1575), 787.5)
+        self.assertEqual(feedback_speed_rpm(0, 1575), 0)
+
+    def test_feedback_target_tracks_motor_and_control_phase(self):
+        self.assertEqual(feedback_target_rpm('左', -8192, 4096, 300, False), 0)
+        self.assertEqual(feedback_target_rpm('右', -8192, 4096, 300, False), 0)
+        self.assertEqual(feedback_target_rpm('左', -8192, 4096, 300, True), -150)
+        self.assertEqual(feedback_target_rpm('右', -8192, 4096, 300, True), 75)
+
+    def test_battery_level_table(self):
+        expected = {
+            0: '放电，10%以下', 5: '放电，10%', 12: '放电，20%',
+            20: '放电，40%', 44: '放电，60%', 75: '放电，80%',
+            102: '放电，100%', 122: '充电，10%及以下',
+            130: '充电，20%', 140: '充电，40%', 160: '充电，60%',
+            180: '充电，80%', 220: '充电，100%',
+        }
+        for raw, level in expected.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(battery_level(raw), level)
+        self.assertEqual(battery_level(103), '未知等级（原始值=103）')
+
+    def test_feedback_console_rate_limit_and_fault_change(self):
+        self.assertTrue(should_print_feedback(None, 0, 10.0))
+        self.assertFalse(should_print_feedback((0, 10.0), 0, 10.499))
+        self.assertTrue(should_print_feedback((0, 10.0), 0, 10.5))
+        self.assertTrue(should_print_feedback((0, 10.0), 0x0A, 10.1))
+        self.assertTrue(should_print_feedback((0x0A, 10.0), 0x10, 10.1))
 
 
 if __name__ == '__main__':

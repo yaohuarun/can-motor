@@ -87,6 +87,56 @@ def parse_feedback(can_id, data):
                 extra=data[6], revolutions=data[7])
 
 
+def feedback_fault_label(fault, previous_fault=None):
+    if fault == 0:
+        return '无故障，0x0A已清除' if previous_fault == 0x0A else '无故障'
+    if fault == 0x0A:
+        return 'CAN接收故障告警，继续收发不退出'
+    return '其他故障'
+
+
+def feedback_speed_rpm(speed_raw, max_rpm):
+    return speed_raw / 16384 * max_rpm
+
+
+def battery_level(battery_raw):
+    levels = {
+        0: '放电，10%以下', 5: '放电，10%', 12: '放电，20%',
+        20: '放电，40%', 44: '放电，60%', 75: '放电，80%',
+        102: '放电，100%', 122: '充电，10%及以下',
+        130: '充电，20%', 140: '充电，40%', 160: '充电，60%',
+        180: '充电，80%', 220: '充电，100%',
+    }
+    return levels.get(battery_raw, f'未知等级（原始值={battery_raw}）')
+
+
+def feedback_target_rpm(wheel, left_raw, right_raw, max_rpm, running):
+    if not running:
+        return 0.0
+    return feedback_speed_rpm(left_raw if wheel == '左' else right_raw, max_rpm)
+
+
+def format_feedback(can_id, data, status, target_rpm, max_rpm, previous_fault=None):
+    fault = status['fault']
+    label = feedback_fault_label(fault, previous_fault)
+    speed_rpm = feedback_speed_rpm(status['speed_raw'], max_rpm)
+    if round(speed_rpm, 1) == 0:
+        speed_rpm = 0.0
+    return (f'RX ID=0x{can_id:03X} {status["wheel"]}轮 '
+            f'DATA={bytes(data).hex(" ").upper()} '
+            f'目标转速={target_rpm:.1f} rpm '
+            f'速度={speed_rpm:.1f} rpm '
+            f'Q轴电流原始值={status["current_raw"]} '
+            f'故障=0x{fault:02X}（{label}） '
+            f'电池电量={battery_level(status["battery_raw"])} '
+            f'运行圈数={status["revolutions"]}')
+
+
+def should_print_feedback(previous, fault, now):
+    return (previous is None or previous[0] != fault or
+            now - previous[1] >= 0.5)
+
+
 class StartupRecovery:
     """0x0A只告警；启动前继续零速等待，运行中保持周期收发。"""
     def __init__(self, started, timeout):
@@ -292,16 +342,13 @@ def main(argv=None):
                     now = time.monotonic()
                     latest[status['wheel']] = (status['fault'], now)
                     previous = last_print.get(status['wheel'])
-                    if previous is None or previous[0] != status['fault'] or now - previous[1] >= 0.5:
-                        fault = status['fault']
-                        label = ('无故障' if fault == 0 else
-                                 'CAN接收故障告警，继续收发不退出' if fault == 0x0A else '其他故障')
-                        if fault == 0 and previous is not None and previous[0] == 0x0A:
-                            label = '无故障，0x0A已清除'
-                        print(f'RX ID=0x{msg.arbitration_id:03X} {status["wheel"]}轮 '
-                              f'DATA={msg.data.hex(" ").upper()} '
-                              f'故障=0x{fault:02X}（{label}） '
-                              f'速度原始值={status["speed_raw"]}')
+                    if should_print_feedback(previous, status['fault'], now):
+                        target_rpm = feedback_target_rpm(
+                            status['wheel'], left, right, max_rpm,
+                            recovery.running and not a.startup_only)
+                        print(format_feedback(msg.arbitration_id, msg.data, status,
+                                              target_rpm, max_rpm,
+                                              None if previous is None else previous[0]))
                         last_print[status['wheel']] = (status['fault'], now)
                     if not a.startup_only or status['fault'] not in (0, 0x0A):
                         recovery.observe(status)
