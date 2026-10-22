@@ -180,7 +180,9 @@ def main(argv=None):
     p.add_argument('--channel', default=None,
                    help='PCAN通道名（默认PCAN_USBBUS1）；旧后端使用0或1')
     p.add_argument('--device', type=int, default=0)
-    p.add_argument('--backend', choices=['pcan', 'canalystii', 'controlcan'], default='pcan')
+    p.add_argument('--backend', choices=['auto', 'pcan', 'canalystii', 'controlcan'],
+                   default='auto',
+                   help='CAN后端；auto在Windows和Linux/Ubuntu均使用pcan')
     p.add_argument('--library', '--dll', dest='dll',
                    help='厂商ControlCAN.dll或libcontrolcan.so路径，默认按系统和架构选择')
     p.add_argument('--torque', type=int, default=20)
@@ -201,7 +203,9 @@ def main(argv=None):
         bounded(a.tx_timeout, 0.001, 5, '发送等待秒数')
         bounded(a.startup_timeout, 0.1, 300, '零速观察秒数')
         bounded(a.device, 0, 255, '设备索引')
-        if a.backend != 'pcan' and a.channel not in (None, '0', '1'):
+        from controlcan_backend import resolve_backend
+        resolved_backend = resolve_backend(a.backend)
+        if resolved_backend != 'pcan' and a.channel not in (None, '0', '1'):
             raise ValueError('canalystii/controlcan 的通道必须为0或1')
         # 使用配置帧的0.1rpm精度作为换算基准。
         bounded(a.max_rpm, 0.1, 6553.5, '最高转速')
@@ -224,7 +228,7 @@ def main(argv=None):
             frames = [(0x103, cmd), (0x103, cfg)]
             zero = [(0x103, control_frame(0, 0, a.torque, a.depth)), (0x103, cfg)]
             off = [(0x103, control_frame(0, 0, 0, 0, False)), (0x103, cfg)]
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         p.error(str(exc))
     if a.startup_only:
         frames = zero
@@ -248,7 +252,7 @@ def main(argv=None):
     period = a.period_ms / 1000
     try:
         from controlcan_backend import open_bus
-        bus = open_bus(a.backend, a.channel, a.device, a.dll)
+        bus = open_bus(resolved_backend, a.channel, a.device, a.dll)
     except Exception as exc:
         print(f'CAN接口打开失败，未发送指令：{exc}\n'
               '请检查USB连接、设备索引、设备驱动，并关闭占用设备的厂商软件。\n'

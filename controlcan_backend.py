@@ -6,6 +6,18 @@ from pathlib import Path
 import time
 
 
+def resolve_backend(backend='auto'):
+    """Resolve the portable CLI default without changing explicit choices."""
+    system = platform.system()
+    if system == 'Linux':
+        if backend not in ('auto', 'pcan'):
+            raise RuntimeError('Linux/Ubuntu版本仅支持PCAN后端，请使用--backend pcan')
+        return 'pcan'
+    if system == 'Windows':
+        return 'pcan' if backend == 'auto' else backend
+    raise RuntimeError(f'不支持的操作系统：{system}；请显式指定可用的CAN后端')
+
+
 def library_path(dll_path=None):
     if dll_path:
         return Path(dll_path).expanduser().resolve(strict=True)
@@ -126,6 +138,7 @@ class ControlCanBus:
 
 
 def open_bus(backend, channel, device, dll_path=None):
+    backend = resolve_backend(backend)
     if backend == 'pcan':
         import can
         # PEAK's Windows driver exposes channels by symbolic names.  Keeping the

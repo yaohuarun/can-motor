@@ -1,7 +1,9 @@
-# PEAK PCAN 电动轮椅电机速度控制
+# Windows / Ubuntu 电动轮椅电机速度控制
 
 依据 `D:\work\doc\电动轮椅CAN通讯协议通用解密版.pdf` 第2～7页编写，Python 3.10+。
-默认使用 python-can 的 PCAN 后端和 PEAK-System Windows 驱动，500 kbit/s、标准数据帧、8字节数据。
+Windows 和 Ubuntu/Linux 默认都使用 python-can 的 PCAN 后端及 PEAK-System 驱动，
+均为500 kbit/s、标准数据帧、8字节数据。Linux 版本仅支持 PCAN；Windows 仍可通过
+`--backend controlcan` 或 `--backend canalystii` 使用旧兼容硬件。
 
 ## Windows / PEAK PCAN 安装
 
@@ -28,74 +30,55 @@ python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.02 --angula
 `PeakOemDrv.exe` 是系统驱动安装程序，不复制进项目，也不通过 `--library` 加载。
 python-can 的 `pcan` 接口会调用驱动安装的 PCAN-Basic 运行库。
 
-## 旧 CANalyst-II 后端（保留兼容）
+## Ubuntu / PEAK PCAN 安装（Python 3.10+）
 
-### Ubuntu运行（Python 3.10+）
+将项目和最新的 Linux 驱动包
+`peak-linux-driver-8.17.0 (1).tar.gz` 复制到 Ubuntu。驱动包当前位于 Windows：
+`D:\BaiduNetdiskDownload\PCAN\驱动\linux\peak-linux-driver`。
 
-将整个项目目录复制到Ubuntu（包含 `libs/linux`），进入项目目录执行：
+先安装编译依赖，再构建默认的字符设备驱动及 PCAN-Basic 动态库：
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv python3-pip libusb-1.0-0 usbutils
+sudo apt install build-essential "linux-headers-$(uname -r)" libpopt-dev g++ \
+  python3 python3-venv python3-pip
+tar -xzf 'peak-linux-driver-8.17.0 (1).tar.gz'
+cd peak-linux-driver-8.17.0
+make clean all
+sudo make install
+sudo modprobe pcan
+sudo ldconfig
+cd /path/to/can-motor
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-配置USB访问权限（规则只匹配CANalyst-II的VID/PID 04d8:0053）：
+`make install` 会安装驱动包自带的 udev 规则。插入 PCAN-USB 后检查：
 
 ```bash
-sudo install -m 644 99-canalystii.rules /etc/udev/rules.d/99-canalystii.rules
-sudo usermod -aG plugdev "$USER"
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=usb
+cat /proc/pcan
+ls -l /dev/pcanusb* /dev/pcan32 2>/dev/null
 ```
 
-注销并重新登录以生效组权限，重新插拔USB，再激活虚拟环境。
-用 `lsusb -d 04d8:0053` 检查设备；如果VID/PID不同，先确认实际型号，
-不要直接用其他设备的规则。无需Windows DLL、Zadig或配置 `can0`。
+默认构建的是 PEAK 字符设备驱动，不需要配置 `can0`。不要同时加载内核自带的
+`peak_usb` SocketCAN 驱动；若设备被它占用，请按驱动包用户手册处理模块冲突。
+Ubuntu 内核升级后，通常需要针对新内核重新执行 `make clean all` 和 `sudo make install`。
 
-优先使用厂商Linux后端（与此前Windows成功路径相同的VCI API）：
+先进行只接收诊断，再预览控制帧；确认硬件安全后才添加 `--send`：
 
 ```bash
 # 接收诊断，不发送控制报文
-python can_diagnose.py --backend controlcan --channel 0 --seconds 5
+python can_diagnose.py --channel PCAN_USBBUS1 --seconds 5
 # 先预览，不连接设备
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0
 # 零速观察5秒，无故障后以目标速度运行60秒
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 --startup-timeout 5 --duration 60 --send
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 \
+  --startup-timeout 5 --duration 60 --send
 ```
 
 按实车方向校准，默认左轮方向-1、右轮+1，正线速度对应前进。
 启动观察期间仍发送零速使能和配置；目标速度前不会提前运行，结束发送零速和失能。
-
-`controlcan` 在Linux使用 `ctypes.CDLL` 加载厂商SO（cdecl），
-在Windows使用 `ctypes.WinDLL` 加载DLL（stdcall）。厂商Linux头文件v2.02将
-DWORD/ULONG定义为32位，代码使用固定32位类型，避免64位Linux的long宽度差异。
-内置库按CPU与Python位数选择：
-
-| 平台 | 路径 |
-| --- | --- |
-| PC 64位 | `libs/linux/x86_64/libcontrolcan.so` |
-| PC 32位 | `libs/linux/x86/libcontrolcan.so` |
-| ARM 64位 | `libs/linux/aarch64/libcontrolcan.so` |
-| ARM 32位 | `libs/linux/arm/libcontrolcan.so` |
-
-这些SO来自本地厂商Linux资料包V1.45。如架构/依赖不兼容，可用
-`--library /absolute/path/libcontrolcan.so` 指定该设备的新版厂商库；`--dll`仍作为兼容别名。
-遇到加载错误，PC64位可运行 `file libs/linux/x86_64/libcontrolcan.so` 和
-`ldd libs/linux/x86_64/libcontrolcan.so` 检查架构和缺失依赖，其他平台替换对应路径。
-运行权限错误时检查udev和组权限，不需要以root身份持续运行电机程序。
-
-也保留跨平台的开源USB后端（[python-can官方说明](https://python-can.readthedocs.io/en/stable/interfaces/canalystii.html)）：
-
-```bash
-python can_diagnose.py --backend canalystii --channel 0 --seconds 5
-```
-
-此前此设备的开源后端出现过发送队列超时，Ubuntu下也需单独验证，
-不能用接收成功代替发送成功。当前只在Windows环境完成自动测试和Linux库ELF架构检查，
-尚未在Ubuntu与电机实物上验证。
 
 ## 参数和接线
 
@@ -145,7 +128,7 @@ python motor_control.py --max-rpm 300 --linear-speed 0 --angular-speed 0.2
 python -m pip install -r requirements.txt
 ```
 
-旧 `canalystii` 后端采用 USB 用户态驱动；Windows 需配置 libusb-win32，
+以下旧后端仅在 Windows 保留兼容。`canalystii` 后端采用 USB 用户态驱动，需配置 libusb-win32，
 参考 [python-can 官方文档](https://python-can.readthedocs.io/en/stable/interfaces/canalystii.html)。
 默认 `--backend pcan` 为 PEAK-System 后端；`--backend canalystii` 为旧开源USB后端，
 `--backend controlcan` 为旧厂商DLL/SO后端。
@@ -220,7 +203,7 @@ python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.02 --angula
 控制字0x0D：低3位101使能，bit3为1表示未充电。
 配置的最高转速以0.1 rpm为单位、小端编码；300 rpm对应3000，即 B8 0B。
 支持 `--swap`、`--pi 0..2`、`--left-comp 0..10`、`--right-comp 0..10`。
-运行结束、Ctrl+C或异常时，先连续发送5组零速帧，再发送5组失能帧，最后关闭USB。
+运行结束、Ctrl+C或异常时，先连续发送5组零速帧，再发送5组失能帧，最后关闭CAN接口。
 
 ## 协议解释与未确定项
 
@@ -229,7 +212,7 @@ python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.02 --angula
 仅观察通信恢复，不进入目标速度运行，使用：
 
 ```powershell
-python motor_control.py --backend controlcan --mode direct --max-rpm 100 --startup-only --startup-timeout 60 --send
+python motor_control.py --mode direct --max-rpm 100 --startup-only --startup-timeout 60 --send
 ```
 
 该模式持续60秒发送零速使能＋配置帧并接收反馈，显示原始报文、故障码和每秒汇总。
@@ -250,7 +233,7 @@ python motor_control.py --backend controlcan --mode direct --max-rpm 100 --start
 
 ```powershell
 # 显式零速观察5秒，再以0.1 m/s直行1分钟
-python motor_control.py --backend controlcan --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 --startup-timeout 5 --duration 60 --send
+python motor_control.py --mode direct --max-rpm 300 --linear-speed 0.1 --angular-speed 0 --startup-timeout 5 --duration 60 --send
 ```
 
 零速使能期间可能释放电磁刹车，应固定车体防止溜车。正负速度与实际前进方向的对应取决于电机安装与接线。
@@ -279,7 +262,7 @@ external模式发送零速外部控制帧，配置仍由原上控负责。
 
 ## 检查
 
-### 使用本地厂商DLL后端对照测试
+### Windows：使用旧厂商DLL后端对照测试
 
 项目已从本机厂商资料包复制32/64位DLL到 `libs/x86`、`libs/x64`，
 按当前Python位数自动选择。来源为 `D:\work\doc\CAN分析仪资料20250326_顶配Pro\CAN分析仪资料20250326_顶配Pro\二次开发库文件`。

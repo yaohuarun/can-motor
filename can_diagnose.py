@@ -33,24 +33,28 @@ def main(argv=None):
     p.add_argument('--channel', default=None,
                    help='PCAN通道名（默认PCAN_USBBUS1）；旧后端使用0或1')
     p.add_argument('--device', type=int, default=0)
-    p.add_argument('--backend', choices=['pcan', 'canalystii', 'controlcan'], default='pcan')
+    p.add_argument('--backend', choices=['auto', 'pcan', 'canalystii', 'controlcan'],
+                   default='auto',
+                   help='CAN后端；auto在Windows和Linux/Ubuntu均使用pcan')
     p.add_argument('--library', '--dll', dest='dll', help='厂商DLL或Linux SO路径')
     p.add_argument('--seconds', type=float, default=5)
     a = p.parse_args(argv)
     try:
         bounded(a.seconds, 0.1, 3600, '诊断时间')
         bounded(a.device, 0, 255, '设备索引')
-        if a.backend != 'pcan' and a.channel not in (None, '0', '1'):
+        from controlcan_backend import resolve_backend
+        backend = resolve_backend(a.backend)
+        if backend != 'pcan' and a.channel not in (None, '0', '1'):
             raise ValueError('canalystii/controlcan 的通道必须为0或1')
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         p.error(str(exc))
     bus = None
     try:
         import can
         from controlcan_backend import open_bus
-        bus = open_bus(a.backend, a.channel, a.device, a.dll)
-        channel = a.channel or ('PCAN_USBBUS1' if a.backend == 'pcan' else '0')
-        print(f'接收诊断 backend={a.backend}, channel={channel}, 500000 bit/s，不发送控制报文。')
+        bus = open_bus(backend, a.channel, a.device, a.dll)
+        channel = a.channel or ('PCAN_USBBUS1' if backend == 'pcan' else '0')
+        print(f'接收诊断 backend={backend}, channel={channel}, 500000 bit/s，不发送控制报文。')
         capture(bus, a.seconds)
     except KeyboardInterrupt:
         return 130
