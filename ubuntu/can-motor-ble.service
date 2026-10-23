@@ -1,0 +1,22 @@
+[Unit]
+Description=CAN Motor BLE Gateway
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+User=canmotor
+Group=canmotor
+WorkingDirectory=/opt/can-motor
+ExecStart=/opt/can-motor/.venv/bin/python /opt/can-motor/ble_gateway_service.py --mock-can
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+DevicePolicy=closed
+DeviceAllow=/dev/bus/usb rw
+
+[Install]
+WantedBy=multi-user.target

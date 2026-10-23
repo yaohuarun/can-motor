@@ -1,0 +1,3 @@
+# Copy to local.properties when Gradle cannot discover the Android SDK.
+# On this workstation: sdk.dir=D\:\\android_sdk
+sdk.dir=/path/to/android-sdk

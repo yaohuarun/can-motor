@@ -4,3 +4,8 @@ __pycache__/
 venv/
 tmp/
 .pytest_cache/
+.gradle/
+build/
+**/build/
+local.properties
+.idea/

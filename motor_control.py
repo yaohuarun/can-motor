@@ -5,6 +5,7 @@ import argparse
 import math
 import struct
 import sys
+import threading
 import time
 
 GEAR_RATIO = 15.75
@@ -180,6 +181,91 @@ class StartupRecovery:
         return True
 
 
+class MotorControlSession:
+    """Own one CAN lifecycle with injectable backend and monotonic clock."""
+
+    def __init__(self, bus, can_module, channel=None, tx_timeout=0.1,
+                 clock=time.monotonic, sleeper=time.sleep):
+        self.bus = bus
+        self.can = can_module
+        self.channel = channel
+        self.tx_timeout = tx_timeout
+        self.clock = clock
+        self.sleep = sleeper
+        self.closed = False
+        self._target_lock = threading.Lock()
+        self._realtime_target = None
+
+    def now(self):
+        return self.clock()
+
+    def transmit(self, batch):
+        for can_id, payload in batch:
+            message = self.can.Message(arbitration_id=can_id, data=payload,
+                                       is_extended_id=False, channel=self.channel)
+            self.bus.send(message, timeout=self.tx_timeout)
+
+    def receive_feedback(self, limit=100):
+        for _ in range(limit):
+            message = self.bus.recv(timeout=0)
+            if message is None:
+                return
+            if (message.is_extended_id or message.is_remote_frame or
+                    message.is_error_frame):
+                continue
+            status = parse_feedback(message.arbitration_id, message.data)
+            if status is not None:
+                yield message, status
+
+    def wait_until(self, deadline):
+        self.sleep(max(0, deadline - self.now()))
+
+    def update_realtime_target(self, linear_speed, angular_speed, max_rpm,
+                               left_direction=-1, right_direction=1,
+                               mode='external', config=None, torque=20, depth=100):
+        """Validate and atomically replace the single pending realtime target."""
+        left_rpm, right_rpm = differential_wheel_rpm(linear_speed, angular_speed)
+        left = wheel_speed_raw(left_rpm, max_rpm, left_direction)
+        right = wheel_speed_raw(right_rpm, max_rpm, right_direction)
+        if mode == 'external':
+            frames = [(0x108, external_frame(right, left))]
+        elif mode == 'direct':
+            if config is None:
+                raise ValueError('direct mode requires a configuration frame')
+            frames = [(0x103, control_frame(right, left, torque, depth)),
+                      (0x103, config)]
+        else:
+            raise ValueError('unknown motor control mode')
+        with self._target_lock:
+            self._realtime_target = (frames, left, right)
+        return left, right
+
+    def current_realtime_target(self):
+        with self._target_lock:
+            return self._realtime_target
+
+    def safe_stop(self, zero_frames):
+        """Atomically discard motion and ensure the next cycle is zero speed."""
+        with self._target_lock:
+            self._realtime_target = (list(zero_frames), 0, 0)
+
+    def close(self, zero_frames, off_frames, period):
+        if self.closed:
+            return []
+        self.closed = True
+        errors = []
+        try:
+            for batch in (zero_frames,) * 5 + (off_frames,) * 5:
+                try:
+                    self.transmit(batch)
+                except Exception as exc:
+                    errors.append(str(exc))
+                self.sleep(period)
+        finally:
+            self.bus.shutdown()
+        return errors
+
+
 def prepare_usb_backend():
     """提前加载并缓存后端，供 canalystii 内部 usb.core.find() 使用。"""
     import usb.backend.libusb1
@@ -309,14 +395,11 @@ def main(argv=None):
               'Ubuntu需检查libusb依赖和udev权限；Windows需匹配USB驱动，详见README。', file=sys.stderr)
         return 1
 
-    def transmit(batch):
-        for can_id, payload in batch:
-            bus.send(can.Message(arbitration_id=can_id, data=payload,
-                                 is_extended_id=False, channel=a.channel), timeout=a.tx_timeout)
+    session = MotorControlSession(bus, can, a.channel, a.tx_timeout)
 
     result = 0
     try:
-        started = time.monotonic()
+        started = session.now()
         recovery = StartupRecovery(started, a.startup_timeout)
         deadline = started + a.startup_timeout if a.startup_only else None
         next_send = started
@@ -327,8 +410,8 @@ def main(argv=None):
               '接收左右轮反馈；即使故障提前清除也不提前运行。')
         for can_id, payload in zero:
             print(f'启动发送 ID=0x{can_id:03X} DATA={payload.hex(" ").upper()}')
-        while deadline is None or time.monotonic() < deadline:
-            transmit(frames if recovery.running and not a.startup_only else zero)
+        while deadline is None or session.now() < deadline:
+            session.transmit(frames if recovery.running and not a.startup_only else zero)
             next_send += period
             # 非阻塞读取，限制单周期数量，避免繁忙总线饿死发送。
             for _ in range(100):
@@ -339,7 +422,7 @@ def main(argv=None):
                     continue
                 status = parse_feedback(msg.arbitration_id, msg.data)
                 if status:
-                    now = time.monotonic()
+                    now = session.now()
                     latest[status['wheel']] = (status['fault'], now)
                     previous = last_print.get(status['wheel'])
                     if should_print_feedback(previous, status['fault'], now):
@@ -352,7 +435,7 @@ def main(argv=None):
                         last_print[status['wheel']] = (status['fault'], now)
                     if not a.startup_only or status['fault'] not in (0, 0x0A):
                         recovery.observe(status)
-            now = time.monotonic()
+            now = session.now()
             if not a.startup_only and deadline is None and recovery.begin_run(now, latest):
                 deadline = now + a.duration
                 print(f'零速观察结束，左右轮最新反馈无故障；开始目标速度控制，运行{a.duration:g}秒。')
@@ -372,7 +455,7 @@ def main(argv=None):
             if next_send < now:
                 next_send = now  # 不补发积压的运动指令
             limit = deadline if deadline is not None else max(recovery.deadline, next_send)
-            time.sleep(max(0, min(next_send, limit) - now))
+            session.wait_until(min(next_send, limit))
         if a.startup_only:
             print('零速诊断结束，发送零速及失能帧；未发送目标速度指令。')
     except KeyboardInterrupt:
@@ -392,10 +475,10 @@ def main(argv=None):
             stop_errors = []
             for batch in (zero,) * 5 + (off,) * 5:
                 try:
-                    transmit(batch)
+                    session.transmit(batch)
                 except Exception as exc:
                     stop_errors.append(str(exc))
-                time.sleep(period)
+                session.sleep(period)
             if stop_errors:
                 result = 1
                 print(f'停止帧发送失败 {len(stop_errors)}/10 组：{stop_errors[0]}。'

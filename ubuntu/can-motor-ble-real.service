@@ -1,0 +1,25 @@
+[Unit]
+Description=CAN Motor BLE Gateway (commissioned real PCAN)
+After=bluetooth.service
+Requires=bluetooth.service
+Conflicts=can-motor-ble.service
+ConditionPathExists=/etc/can-motor/real-can-enabled
+
+[Service]
+Type=simple
+User=canmotor
+Group=canmotor
+WorkingDirectory=/opt/can-motor
+ExecStart=/opt/can-motor/.venv/bin/python /opt/can-motor/ble_gateway_service.py --real-can --confirm-hardware-commissioned --mode direct --channel PCAN_USBBUS1 --max-rpm 1600 --max-linear-speed 0.10 --max-angular-speed 0.30
+Restart=no
+TimeoutStopSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+DevicePolicy=closed
+DeviceAllow=/dev/bus/usb rw
+DeviceAllow=/dev/pcanusb rw
+
+[Install]
+WantedBy=multi-user.target
