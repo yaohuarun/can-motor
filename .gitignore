@@ -5,6 +5,9 @@ venv/
 tmp/
 .pytest_cache/
 .gradle/
+.kotlin/
+.tmp-gradle/
+.tmp-user-home/
 build/
 **/build/
 local.properties

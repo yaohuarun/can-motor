@@ -53,9 +53,22 @@ def logged_handler(handler):
     return accept
 
 
-async def serve(application, tick, shutdown):
+def poll_and_log_watchdog(machine, poll):
+    previous = machine.state
+    last_valid_at = machine.last_valid_at
+    state = poll()
+    if (previous != state and machine.reason == StopReason.WATCHDOG and
+            last_valid_at is not None):
+        elapsed_ms = round((machine.clock() - last_valid_at) * 1000)
+        print('BLE watchdog stop:', f'no valid command for {elapsed_ms} ms',
+              f'last_sequence={machine.last_sequence}', flush=True)
+    return state
+
+
+async def serve(application, tick, shutdown, adapter_address=None):
     transport = await DbusNextBluezTransport.connect_system()
-    peripheral = BluezPeripheral(transport, application)
+    peripheral = BluezPeripheral(
+        transport, application, adapter_address=adapter_address)
     await peripheral.start()
     try:
         while True:
@@ -77,12 +90,12 @@ async def run_mock(args):
             value, args.max_linear_speed, args.max_angular_speed)), security)
 
     async def tick():
-        machine.poll()
+        poll_and_log_watchdog(machine, machine.poll)
         application.publish_status(status_payload(machine))
         await asyncio.sleep(0.05)
 
     print('BLE gateway running with simulated CAN; no motor backend is open', flush=True)
-    await serve(application, tick, lambda: None)
+    await serve(application, tick, lambda: None, args.adapter_address)
 
 
 def make_stop_frames(args):
@@ -188,7 +201,7 @@ async def run_real(args):
         async def tick():
             nonlocal left_fault, right_fault, feedback_seen
             try:
-                gateway.poll()
+                poll_and_log_watchdog(machine, gateway.poll)
                 target = session.current_realtime_target()
                 session.transmit(zero if target is None else target[0])
                 for _, feedback in session.receive_feedback():
@@ -217,7 +230,7 @@ async def run_real(args):
 
         print('REAL CAN ENABLED: wheels must remain off the ground; hardware E-stop required',
               flush=True)
-        await serve(application, tick, shutdown)
+        await serve(application, tick, shutdown, args.adapter_address)
     finally:
         shutdown()
 
@@ -234,6 +247,8 @@ def parse_args(argv=None):
     parser.add_argument('--confirm-hardware-commissioned', action='store_true',
                         help='deployment acknowledgement after hardware acceptance')
     parser.add_argument('--channel', default='PCAN_USBBUS1')
+    parser.add_argument('--adapter-address',
+                        help='stable Bluetooth controller MAC address')
     parser.add_argument('--mode', choices=('external', 'direct'), default='direct',
                         help='direct uses 0x103; external uses 0x108')
     parser.add_argument('--max-rpm', type=float, default=3000.0)
@@ -251,6 +266,14 @@ def parse_args(argv=None):
     parser.add_argument('--undervoltage', type=int, default=22)
     parser.add_argument('--brake-voltage', type=int, default=13)
     args = parser.parse_args(argv)
+    if args.adapter_address is not None:
+        parts = args.adapter_address.split(':')
+        if (len(parts) != 6 or
+                any(len(part) != 2 or any(
+                    character not in '0123456789abcdefABCDEF'
+                    for character in part) for part in parts)):
+            parser.error('--adapter-address must be a Bluetooth MAC address')
+        args.adapter_address = args.adapter_address.upper()
     if args.max_rpm <= 0 or args.max_linear_speed <= 0 or args.max_angular_speed <= 0:
         parser.error('speed limits must be positive')
     if not 1 <= args.can_period_ms <= 1000:

@@ -43,8 +43,42 @@ class BleControlStateMachine:
                 max_linear_speed=max_linear_speed,
                 max_angular_speed=max_angular_speed)
         except ProtocolError:
-            self.safe_stop(StopReason.INVALID_COMMAND)
-            return CommandResult(False, None, self.state, self.reason)
+            # An app restart resets its sequence counter while the gateway
+            # session can remain alive.  After the first stale sequence has
+            # stopped motion, accept only a structurally valid centered-zero
+            # frame as the new sequence baseline.  Malformed, wrong-session,
+            # out-of-range, and moving frames remain latched safe.
+            if (self.state == ControlState.SAFE_STOP and
+                    self.reason == StopReason.INVALID_COMMAND):
+                try:
+                    command = decode_command(
+                        payload, expected_session=self.session_id,
+                        previous_sequence=None,
+                        max_linear_speed=max_linear_speed,
+                        max_angular_speed=max_angular_speed)
+                except ProtocolError:
+                    return CommandResult(False, None, self.state, self.reason)
+                if (command.centered and command.linear_speed == 0 and
+                        command.angular_speed == 0):
+                    self.last_sequence = None
+                    self.state = ControlState.WAIT_CENTER
+                else:
+                    return CommandResult(False, command, self.state, self.reason)
+            else:
+                self.safe_stop(StopReason.INVALID_COMMAND)
+                return CommandResult(False, None, self.state, self.reason)
+        if (self.state == ControlState.SAFE_STOP and
+                self.reason in (StopReason.WATCHDOG, StopReason.INVALID_COMMAND)):
+            # Watchdog and invalid-command stops are recoverable only after the current
+            # controller proves that its command stream is alive again and
+            # the physical control is centered. This also covers a valid,
+            # forward-sequence zero after an invalid startup/session frame.
+            # Other safe-stop reasons
+            # remain latched and require operator intervention.
+            if not (command.centered and command.linear_speed == 0 and
+                    command.angular_speed == 0):
+                return CommandResult(False, command, self.state, self.reason)
+            self.state = ControlState.WAIT_CENTER
         if self.state == ControlState.WAIT_CENTER and not (
                 command.centered and command.linear_speed == 0 and
                 command.angular_speed == 0):

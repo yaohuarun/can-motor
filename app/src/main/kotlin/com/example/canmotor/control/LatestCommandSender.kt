@@ -2,6 +2,7 @@ package com.example.canmotor.control
 
 import com.example.canmotor.protocol.BleProtocol
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -12,11 +13,24 @@ class LatestCommandSender(private val joystick: JoystickController) {
     val running get() = job?.isActive == true
 
     @Synchronized fun start(scope: CoroutineScope, session: () -> Long,
-                            armed: () -> Boolean, send: (ByteArray) -> Unit) {
+                            armed: () -> Boolean, send: (ByteArray) -> Boolean,
+                            onLinkFailure: () -> Unit = {}) {
         if (running) return
-        job = scope.launch {
+        job = scope.launch(Dispatchers.Default) {
+            var lastSuccessfulWriteNanos = System.nanoTime()
             while (isActive) {
-                send(BleProtocol.encodeCommand(joystick.nextCommand(session(), armed())))
+                val submitted = try {
+                    send(BleProtocol.encodeCommand(joystick.nextCommand(session(), armed())))
+                } catch (_: Exception) {
+                    false
+                }
+                val now = System.nanoTime()
+                if (submitted) lastSuccessfulWriteNanos = now
+                if (!submitted && now - lastSuccessfulWriteNanos >= 150_000_000L) {
+                    joystick.center()
+                    onLinkFailure()
+                    break
+                }
                 delay(50)
             }
         }

@@ -28,6 +28,39 @@ class BleControlStateMachineTests(unittest.TestCase):
             self.assertTrue(self.machine.accept(self.command(sequence, 0.1), 1, 1).accepted)
             self.assertEqual(self.machine.poll(), ControlState.ARMED)
 
+    def test_invalid_first_frame_recovers_with_current_session_zero(self):
+        for invalid in (b'bad', self.command(1, session=6, centered=True)):
+            with self.subTest(invalid=invalid):
+                self.machine.connect(7)
+                self.assertFalse(self.machine.accept(invalid, 1, 1).accepted)
+                self.assertEqual(self.machine.reason, StopReason.INVALID_COMMAND)
+                self.assertFalse(self.machine.accept(self.command(2, 0.1), 1, 1).accepted)
+                self.assertEqual(self.machine.target, (0, 0))
+                result = self.machine.accept(self.command(3, centered=True), 1, 1)
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.reason, StopReason.NONE)
+                self.assertEqual(self.machine.target, (0, 0))
+                self.assertTrue(self.machine.accept(self.command(4, 0.1), 1, 1).accepted)
+
+    def test_invalid_after_arming_recovers_with_forward_sequence_zero(self):
+        self.machine.accept(self.command(10, centered=True), 1, 1)
+        self.machine.accept(self.command(11, 0.1), 1, 1)
+        self.machine.accept(b'bad', 1, 1)
+        self.assertTrue(self.machine.accept(self.command(12, centered=True), 1, 1).accepted)
+        self.assertEqual(self.machine.last_sequence, 12)
+        self.assertEqual(self.machine.reason, StopReason.NONE)
+
+    def test_zero_does_not_clear_hardware_or_shutdown_stop(self):
+        for reason in (StopReason.CAN_FAULT, StopReason.SPEED_LIMIT,
+                       StopReason.SHUTDOWN, StopReason.BLUEZ_LOST):
+            with self.subTest(reason=reason):
+                self.machine.connect(7)
+                self.machine.safe_stop(reason)
+                self.assertFalse(self.machine.accept(
+                    self.command(1, centered=True), 1, 1).accepted)
+                self.assertEqual(self.machine.reason, reason)
+                self.assertEqual(self.machine.target, (0, 0))
+
     def test_watchdog_boundary_invalid_and_disconnect(self):
         self.machine.accept(self.command(1, centered=True), 1, 1)
         self.clock.now = 0.300
@@ -37,9 +70,34 @@ class BleControlStateMachineTests(unittest.TestCase):
         self.assertEqual(self.machine.reason, StopReason.WATCHDOG)
         self.assertEqual(self.machine.target, (0, 0))
 
+        moving = self.machine.accept(self.command(2, 0.1), 1, 1)
+        self.assertFalse(moving.accepted)
+        self.assertEqual(self.machine.state, ControlState.SAFE_STOP)
+        centered = self.machine.accept(self.command(3, centered=True), 1, 1)
+        self.assertTrue(centered.accepted)
+        self.assertEqual(self.machine.state, ControlState.ARMED)
+        self.assertEqual(self.machine.reason, StopReason.NONE)
+
         self.machine.connect(8)
         self.assertFalse(self.machine.accept(self.command(2, session=7), 1, 1).accepted)
         self.assertEqual(self.machine.reason, StopReason.INVALID_COMMAND)
+        # Wrong-session frames cannot reset the baseline.
+        self.assertFalse(self.machine.accept(
+            self.command(3, session=7, centered=True), 1, 1).accepted)
+        self.assertEqual(self.machine.state, ControlState.SAFE_STOP)
+
+        self.machine.connect(9)
+        self.assertTrue(self.machine.accept(
+            self.command(100, session=9, centered=True), 1, 1).accepted)
+        self.assertFalse(self.machine.accept(
+            self.command(1, session=9, centered=True), 1, 1).accepted)
+        self.assertEqual(self.machine.reason, StopReason.INVALID_COMMAND)
+        recovered = self.machine.accept(
+            self.command(2, session=9, centered=True), 1, 1)
+        self.assertTrue(recovered.accepted)
+        self.assertEqual(self.machine.state, ControlState.ARMED)
+        self.assertEqual(self.machine.last_sequence, 2)
+
         self.machine.connect(9)
         self.assertEqual(self.machine.state, ControlState.WAIT_CENTER)
         self.assertEqual(self.machine.target, (0, 0))

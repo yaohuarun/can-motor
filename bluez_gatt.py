@@ -51,6 +51,21 @@ def diagnose_adapter(objects, adapter_path='/org/bluez/hci0'):
     return adapter_path
 
 
+def find_adapter_by_address(objects, address):
+    """Return the BlueZ object path for a stable controller address."""
+    expected = address.upper()
+    matches = []
+    for path, interfaces in objects.items():
+        adapter = interfaces.get('org.bluez.Adapter1')
+        if adapter and str(adapter.get('Address', '')).upper() == expected:
+            matches.append(path)
+    if not matches:
+        raise BluezUnavailable(f'Bluetooth adapter {expected} was not found')
+    if len(matches) != 1:
+        raise BluezUnavailable(f'Bluetooth adapter address {expected} is ambiguous')
+    return diagnose_adapter(objects, matches[0])
+
+
 class MotorGattApplication:
     def __init__(self, capabilities, command_handler, security_provider):
         self.capabilities = capabilities
@@ -95,10 +110,12 @@ class MotorGattApplication:
     def start_notify(self, sink):
         self.notification_sink = sink
         self.notifying = True
+        print('BLE status notifications subscribed', flush=True)
 
     def stop_notify(self):
         self.notifying = False
         self.notification_sink = None
+        print('BLE status notifications stopped', flush=True)
 
     def publish_status(self, value):
         self.status_value = bytes(value)
@@ -111,26 +128,42 @@ class MotorGattApplication:
 
 
 class BluezPeripheral:
-    def __init__(self, transport, application, adapter_path='/org/bluez/hci0'):
+    def __init__(self, transport, application, adapter_path='/org/bluez/hci0',
+                 adapter_address=None):
         self.transport = transport
         self.application = application
         self.adapter_path = adapter_path
+        self.adapter_address = adapter_address
         self.registered = False
 
     async def start(self):
         objects = await self.transport.get_managed_objects()
-        diagnose_adapter(objects, self.adapter_path)
+        if self.adapter_address is not None:
+            self.adapter_path = find_adapter_by_address(
+                objects, self.adapter_address)
+        else:
+            diagnose_adapter(objects, self.adapter_path)
+        adapter = objects[self.adapter_path].get('org.bluez.Adapter1', {})
+        print(f'BLE adapter selected: path={self.adapter_path} '
+              f'address={adapter.get("Address", "unknown")} '
+              f'powered={adapter.get("Powered", "unknown")} '
+              f'adapter_discoverable={adapter.get("Discoverable", "unknown")}',
+              flush=True)
         await self.transport.export_application(ROOT_PATH, self.application)
         try:
             await self.transport.register_application(self.adapter_path, ROOT_PATH)
             await self.transport.register_advertisement(
                 self.adapter_path, ADVERTISEMENT_PATH,
                 {'Type': 'peripheral', 'ServiceUUIDs': [SERVICE_UUID],
-                 'LocalName': 'CanMotor'})
+                 'LocalName': 'CanMotor', 'Discoverable': True,
+                 'DiscoverableTimeout': 0})
         except Exception:
             await self.stop()
             raise
         self.registered = True
+        print(f'BLE advertisement registered: adapter={self.adapter_path} '
+              f'name=CanMotor service_uuid={SERVICE_UUID} '
+              'discoverable=True discoverable_timeout=0', flush=True)
 
     async def stop(self):
         # Each cleanup is best-effort because BlueZ may already have disappeared.
@@ -295,13 +328,32 @@ def _build_advertisement_interface(properties):
     from dbus_next.constants import PropertyAccess
 
     class Advertisement(ServiceInterface):
-        def __init__(self): super().__init__('org.bluez.LEAdvertisement1')
+        def __init__(self):
+            super().__init__('org.bluez.LEAdvertisement1')
+            self._tx_power = properties.get('TxPower', 0)
         @dbus_property(access=PropertyAccess.READ)
         def Type(self) -> 's': return properties['Type']
         @dbus_property(access=PropertyAccess.READ)
         def ServiceUUIDs(self) -> 'as': return properties['ServiceUUIDs']
         @dbus_property(access=PropertyAccess.READ)
         def LocalName(self) -> 's': return properties['LocalName']
+        @dbus_property(access=PropertyAccess.READ)
+        def Discoverable(self) -> 'b':
+            # Set the LE instance flags explicitly, independently of desktop
+            # pairing settings and the adapter's global discoverable timeout.
+            return properties.get('Discoverable', True)
+        @dbus_property(access=PropertyAccess.READ)
+        def DiscoverableTimeout(self) -> 'q':
+            return properties.get('DiscoverableTimeout', 0)
+        @dbus_property(access=PropertyAccess.READWRITE)
+        def TxPower(self) -> 'n':
+            # BlueZ versions found in the field both read this property and
+            # write back the controller-selected power during registration.
+            return self._tx_power
+        @TxPower.setter
+        def TxPower(self, value: 'n'):
+            self._tx_power = value
         @method()
-        def Release(self): pass
+        def Release(self):
+            print('BLE advertisement released by BlueZ', flush=True)
     return Advertisement()

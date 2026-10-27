@@ -17,9 +17,19 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.unit.dp
+import java.util.Locale
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
@@ -37,6 +47,8 @@ import com.example.canmotor.control.ControlUiStateReducer
 import com.example.canmotor.control.JoystickController
 import com.example.canmotor.control.LatestCommandSender
 import com.example.canmotor.control.VirtualJoystick
+import com.example.canmotor.control.MotionAction
+import com.example.canmotor.control.MotionButtons
 import com.example.canmotor.protocol.BleProtocol
 import com.example.canmotor.protocol.StopReason
 
@@ -47,6 +59,8 @@ class MainActivity : ComponentActivity() {
     private val sender = LatestCommandSender(joystick)
     private val reducer = ControlUiStateReducer()
     private val screenState = mutableStateOf(ControlUiState())
+    private var stageTimeout: Job? = null
+    private var timedStage: ConnectionStage? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()) { grants ->
@@ -72,7 +86,8 @@ class MainActivity : ComponentActivity() {
             } else if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                 client.onConnected()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                client.onDisconnected()
+                if (status == BluetoothGatt.GATT_SUCCESS) client.onDisconnected()
+                else client.onFailure("蓝牙连接失败：$status，请检查工控机蓝牙和配对状态")
                 sender.stop()
                 reducer.reset()
             }
@@ -115,11 +130,17 @@ class MainActivity : ComponentActivity() {
         transport = AndroidBleTransport(this, scanCallback, gattCallback)
         client = GattClientController(transport)
         setContent { MaterialTheme { MotorControlScreen(screenState, ::scanWithPermission,
-            ::disconnect, ::stopNow, ::updateJoystick) } }
+            ::disconnect, ::stopNow, ::updateJoystick, ::startAction) } }
     }
 
     override fun onStop() {
+        stageTimeout?.cancel()
+        timedStage = null
         stopNow()
+        sender.stop()
+        if (::client.isInitialized) client.disconnect()
+        reducer.reset()
+        publishState()
         super.onStop()
     }
 
@@ -143,7 +164,10 @@ class MainActivity : ComponentActivity() {
         if (characteristic.uuid != BleProtocol.STATUS_UUID) return
         client.onStatus(value)
         val status = client.latestStatus ?: return
-        if (reducer.state.sessionId == 0L) reducer.beginSession(status.sessionId)
+        if (reducer.state.sessionId != status.sessionId) {
+            joystick.center()
+            reducer.beginSession(status.sessionId)
+        }
         reducer.acceptStatus(status)
         startSenderIfReady()
         publishState()
@@ -151,9 +175,18 @@ class MainActivity : ComponentActivity() {
 
     private fun startSenderIfReady() {
         if (client.stage != ConnectionStage.READY || reducer.state.sessionId == 0L) return
-        sender.start(lifecycleScope, { reducer.state.sessionId }, { reducer.state.armed }) {
-            client.send(it)
-        }
+        sender.start(
+            scope = lifecycleScope,
+            session = { reducer.state.sessionId },
+            armed = { reducer.state.armed },
+            send = { client.send(it) },
+            onLinkFailure = {
+                sender.stop()
+                client.onFailure("BLE command writes have failed for at least 150 ms")
+                reducer.connectionChanged(client.stage)
+                publishState()
+            },
+        )
     }
 
     private fun scanWithPermission() {
@@ -169,6 +202,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun disconnect() {
+        stageTimeout?.cancel()
+        timedStage = null
         sender.stop(); joystick.center(); client.disconnect()
         reducer.reset(); publishState()
     }
@@ -185,16 +220,41 @@ class MainActivity : ComponentActivity() {
         joystick.update(x, y, capability.maxLinearSpeed, capability.maxAngularSpeed)
     }
 
+    private fun startAction(action: MotionAction) {
+        if (client.stage != ConnectionStage.READY || !reducer.state.armed) return
+        val capability = client.capabilities ?: return
+        joystick.action(action, capability.maxLinearSpeed, capability.maxAngularSpeed)
+    }
+
     private fun refreshStage() {
         reducer.connectionChanged(client.stage)
         publishState()
+        runOnUiThread {
+            val stage = client.stage
+            if (stage != timedStage) {
+                stageTimeout?.cancel()
+                timedStage = stage
+                if (stage in listOf(ConnectionStage.SCANNING, ConnectionStage.CONNECTING,
+                        ConnectionStage.DISCOVERING, ConnectionStage.READING_CAPABILITIES,
+                        ConnectionStage.SUBSCRIBING)) {
+                    stageTimeout = lifecycleScope.launch {
+                        delay(if (stage == ConnectionStage.SCANNING) 30_000L else 15_000L)
+                        timedStage = null
+                        client.onStageTimeout(stage)
+                        reducer.connectionChanged(client.stage)
+                        publishState()
+                    }
+                }
+            }
+        }
     }
     private fun updateFailure(message: String) {
         screenState.value = screenState.value.copy(connection = ConnectionStage.FAILED,
             message = message)
     }
     private fun publishState() = runOnUiThread {
-        screenState.value = reducer.state.copy(message = client.failure)
+        screenState.value = reducer.state.copy(message = client.failure,
+            maxLinearSpeed = client.capabilities?.maxLinearSpeed)
     }
     private fun requiredPermissions(): Array<String> = if (Build.VERSION.SDK_INT >= 31) {
         arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
@@ -204,24 +264,92 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MotorControlScreen(state: State<ControlUiState>, onScan: () -> Unit,
                        onDisconnect: () -> Unit, onStop: () -> Unit,
-                       onJoystick: (Float, Float) -> Unit) {
+                       onJoystick: (Float, Float) -> Unit,
+                       onAction: (MotionAction) -> Unit = {}) {
     val value = state.value
-    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally,
-           verticalArrangement = Arrangement.Center) {
-        Text("CAN Motor BLE")
-        Text("连接阶段：${value.connection}")
-        Text("会话：${value.sessionId}")
-        Text(if (value.armed) "已解锁" else "等待手柄回中")
-        Text("确认序号：${value.acceptedSequence}")
-        Text("目标：${value.targetLinear} m/s, ${value.targetAngular} rad/s")
-        Text("停车原因：${value.stopReason}")
-        Text("左/右故障：0x${value.leftFault.toString(16)} / 0x${value.rightFault.toString(16)}")
-        value.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        VirtualJoystick(onPosition = onJoystick)
-        if (value.connection == ConnectionStage.IDLE || value.connection == ConnectionStage.FAILED) {
-            Button(onClick = onScan) { Text("扫描并连接") }
-        } else Button(onClick = onDisconnect) { Text("断开连接") }
-        Button(onClick = onStop) { Text("立即停止") }
+    val ready = value.connection == ConnectionStage.READY && value.armed
+    Scaffold(containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        bottomBar = {
+            Surface(shadowElevation = 8.dp) {
+                Button(onClick = onStop,
+                    modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp).height(56.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                    Text("立即停止", style = MaterialTheme.typography.titleMedium)
+                }
+            }
+        }) { insets ->
+        Column(Modifier.fillMaxSize().padding(insets).verticalScroll(rememberScrollState())
+            .padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween) {
+                Column {
+                    Text("电机控制", style = MaterialTheme.typography.headlineSmall)
+                    Text("CAN Motor · BLE", style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (value.connection == ConnectionStage.IDLE || value.connection == ConnectionStage.FAILED) {
+                    Button(onClick = onScan) { Text("扫描连接") }
+                } else OutlinedButton(onClick = onDisconnect) { Text("断开连接") }
+            }
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(when (value.connection) {
+                            ConnectionStage.IDLE -> "未连接"
+                            ConnectionStage.READY -> "蓝牙已连接"
+                            ConnectionStage.FAILED -> "连接失败"
+                            ConnectionStage.SCANNING -> "正在扫描网关…"
+                            ConnectionStage.CONNECTING -> "正在建立蓝牙连接…"
+                            ConnectionStage.DISCOVERING -> "正在发现控制服务…"
+                            ConnectionStage.READING_CAPABILITIES -> "正在读取网关能力…"
+                            ConnectionStage.SUBSCRIBING -> "正在订阅状态…"
+                        }, style = MaterialTheme.typography.titleMedium)
+                        Text(if (ready) "已解锁" else "未解锁",
+                            color = if (ready) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Column(Modifier.weight(1f)) {
+                            Text("目标线速度", style = MaterialTheme.typography.labelMedium)
+                            Text(String.format(Locale.ROOT, "%.2f m/s", value.targetLinear), style = MaterialTheme.typography.titleLarge)
+                        }
+                        Column(Modifier.weight(1f)) {
+                            Text("目标角速度", style = MaterialTheme.typography.labelMedium)
+                            Text(String.format(Locale.ROOT, "%.2f rad/s", value.targetAngular), style = MaterialTheme.typography.titleLarge)
+                        }
+                    }
+                    Text("停车：${value.stopReason}  ·  故障 左/右：${value.leftFault.toString(16)} / ${value.rightFault.toString(16)}",
+                        style = MaterialTheme.typography.bodySmall)
+                    Text("会话 ${value.sessionId}  ·  确认 ${value.acceptedSequence}",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    value.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            }
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("摇杆控制", style = MaterialTheme.typography.titleMedium)
+                    Text("上下前后 · 左右转向 · 松手停车", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    VirtualJoystick(onPosition = onJoystick, onRelease = onStop)
+                }
+            }
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("快捷动作", style = MaterialTheme.typography.titleMedium)
+                    Text("直线速度 0.50 m/s · 按住运行，松开停车", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    value.maxLinearSpeed?.takeIf { it < 0.5f }?.let {
+                        Text(String.format(Locale.ROOT, "网关限速：直线动作实际为 %.2f m/s", it),
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    MotionButtons(ready, onAction, onStop)
+                }
+            }
+        }
     }
 }
 

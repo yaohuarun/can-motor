@@ -16,9 +16,11 @@ data class ControlUiState(
     val leftFault: Int = 0,
     val rightFault: Int = 0,
     val message: String? = null,
+    val maxLinearSpeed: Float? = null,
 )
 
 class ControlUiStateReducer {
+    @Volatile
     var state = ControlUiState()
         private set
 
@@ -40,6 +42,7 @@ class ControlUiStateReducer {
     fun acceptStatus(status: GatewayStatus): Boolean {
         if (status.sessionId != state.sessionId) return false
         if (state.acceptedSequence != 0L &&
+            status.acceptedSequence != state.acceptedSequence &&
             !com.example.canmotor.protocol.BleProtocol.sequenceIsNewer(
                 status.acceptedSequence, state.acceptedSequence)) return false
         state = state.copy(

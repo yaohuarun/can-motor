@@ -14,7 +14,8 @@ class UbuntuDeploymentTests(unittest.TestCase):
         for setting in ('User=canmotor', 'NoNewPrivileges=true',
                         'ConditionPathExists=/etc/can-motor/real-can-enabled',
                         '--real-can', '--confirm-hardware-commissioned',
-                        '--mode direct', '--max-rpm 1600', 'Restart=no'):
+                        '--mode direct', '--max-rpm 3000',
+                        '--adapter-address 90:DE:80:18:88:0E', 'Restart=no'):
             self.assertIn(setting, real)
         self.assertIn('Conflicts=can-motor-ble.service', real)
         self.assertNotIn('--confirm-wheels-off-ground', real)

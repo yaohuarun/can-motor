@@ -16,7 +16,8 @@ import androidx.compose.ui.unit.dp
 import kotlin.math.hypot
 
 @Composable
-fun VirtualJoystick(onPosition: (Float, Float) -> Unit, modifier: Modifier = Modifier) {
+fun VirtualJoystick(onPosition: (Float, Float) -> Unit,
+                    onRelease: () -> Unit = {}, modifier: Modifier = Modifier) {
     var knob by remember { mutableStateOf(Offset.Zero) }
     Canvas(modifier.size(260.dp).pointerInput(Unit) {
         detectDragGestures(
@@ -28,8 +29,16 @@ fun VirtualJoystick(onPosition: (Float, Float) -> Unit, modifier: Modifier = Mod
                 knob = Offset(delta.x * scale, delta.y * scale)
                 onPosition(knob.x / radius, knob.y / radius)
             },
-            onDragEnd = { knob = Offset.Zero; onPosition(0f, 0f) },
-            onDragCancel = { knob = Offset.Zero; onPosition(0f, 0f) },
+            onDragEnd = {
+                knob = Offset.Zero
+                onPosition(0f, 0f)
+                onRelease()
+            },
+            onDragCancel = {
+                knob = Offset.Zero
+                onPosition(0f, 0f)
+                onRelease()
+            },
             onDrag = { change, amount ->
                 change.consume()
                 val radius = minOf(size.width, size.height) / 2f

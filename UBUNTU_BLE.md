@@ -64,6 +64,8 @@ busctl introspect org.bluez /org/bluez/hci0
 
 ## 配对与授权
 
+网关的 LE 广播单独设置为持续可发现（`Discoverable=true`、`DiscoverableTimeout=0`），无需将适配器的全局可发现开关永久打开。新手机配对仍需按下面步骤临时开启配对。已配对手机直接从 App 扫描连接即可。
+
 ```bash
 bluetoothctl
 power on

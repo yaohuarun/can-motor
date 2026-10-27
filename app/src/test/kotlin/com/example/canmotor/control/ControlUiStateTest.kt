@@ -16,6 +16,8 @@ class ControlUiStateTest {
         assertFalse(reducer.acceptStatus(status(7, 100, ControlState.ARMED)))
         assertTrue(reducer.acceptStatus(status(8, 2, ControlState.ARMED)))
         assertTrue(reducer.state.armed)
+        assertTrue(reducer.acceptStatus(status(8, 2, ControlState.SAFE_STOP)))
+        assertFalse(reducer.state.armed)
         assertFalse(reducer.acceptStatus(status(8, 1, ControlState.SAFE_STOP)))
         assertEquals(2, reducer.state.acceptedSequence)
         assertEquals(1, reducer.state.leftFault)

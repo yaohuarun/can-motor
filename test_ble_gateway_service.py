@@ -45,6 +45,13 @@ class BleGatewayServiceTests(unittest.TestCase):
         self.assertEqual(args.battery, 'lithium')
         self.assertEqual(args.pi, 0)
 
+    def test_adapter_address_is_validated_and_normalized(self):
+        args = parse_args([
+            '--mock-can', '--adapter-address', '90:de:80:18:88:0e'])
+        self.assertEqual(args.adapter_address, '90:DE:80:18:88:0E')
+        with self.assertRaises(SystemExit):
+            parse_args(['--mock-can', '--adapter-address', 'not-a-mac'])
+
     def test_external_stop_frames_enable_zero_then_disable(self):
         args = parse_args(['--real-can', '--mode', 'external'])
         zero, off, config = make_stop_frames(args)
